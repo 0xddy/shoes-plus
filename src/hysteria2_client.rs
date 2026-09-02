@@ -42,7 +42,9 @@ use crate::hysteria2_obfs::{ObfuscatedUdpSocket, Salamander};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_addresses_via};
 use crate::rustls_config_util::create_client_config;
-use crate::socket_util::{OutboundSocketOptions, new_outbound_udp_socket};
+use crate::socket_util::{
+    OutboundSocketOptions, QUIC_UDP_SOCKET_BUFFER_TARGET, new_outbound_udp_socket_with_buffer_size,
+};
 use crate::tcp::socket_connector::SocketConnector;
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 
@@ -413,7 +415,13 @@ async fn new_connected_hysteria_udp_socket(
     target: SocketAddr,
     socket_options: &OutboundSocketOptions,
 ) -> io::Result<std::net::UdpSocket> {
-    let socket = new_outbound_udp_socket(target.is_ipv6(), socket_options)?;
+    // A larger kernel queue reduces local drops during bursty QUIC traffic. It
+    // does not make Quinn's stream assembler immune to arbitrary reordering.
+    let socket = new_outbound_udp_socket_with_buffer_size(
+        target.is_ipv6(),
+        socket_options,
+        QUIC_UDP_SOCKET_BUFFER_TARGET,
+    )?;
     socket.connect(target).await?;
     let socket = socket.into_std()?;
     debug_assert_eq!(socket.peer_addr().ok(), Some(target));

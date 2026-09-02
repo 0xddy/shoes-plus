@@ -10,6 +10,19 @@ use std::path::Path;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
+/// Per-direction kernel buffer target used by high-throughput QUIC endpoints.
+///
+/// This is the value passed to `SO_RCVBUF` / `SO_SNDBUF`. FreeBSD and Darwin
+/// may require their system-wide `kern.ipc.maxsockbuf` ceiling to be about 15%
+/// larger, but that padding is not part of the socket's requested buffer size.
+#[cfg(not(target_os = "openbsd"))]
+pub(crate) const QUIC_UDP_SOCKET_BUFFER_TARGET: usize = 8 * 1024 * 1024;
+
+/// OpenBSD rejects socket-buffer requests above its fixed 2 MiB `SB_MAX`
+/// instead of clamping them, and that limit is not a runtime sysctl.
+#[cfg(target_os = "openbsd")]
+pub(crate) const QUIC_UDP_SOCKET_BUFFER_TARGET: usize = 2 * 1024 * 1024;
+
 /// Socket-level options shared by direct TCP and UDP outbound dials.
 ///
 /// QUIC intentionally continues to use its existing endpoint setup. Configuration
@@ -141,8 +154,32 @@ pub fn new_outbound_udp_socket(
     is_ipv6: bool,
     options: &OutboundSocketOptions,
 ) -> std::io::Result<tokio::net::UdpSocket> {
+    new_outbound_udp_socket_inner(is_ipv6, options, None)
+}
+
+/// Create an outbound UDP socket with an explicit best-effort kernel buffer
+/// request, while preserving all source-address and Linux routing options.
+pub(crate) fn new_outbound_udp_socket_with_buffer_size(
+    is_ipv6: bool,
+    options: &OutboundSocketOptions,
+    buffer_size: usize,
+) -> std::io::Result<tokio::net::UdpSocket> {
+    new_outbound_udp_socket_inner(is_ipv6, options, Some(buffer_size))
+}
+
+fn new_outbound_udp_socket_inner(
+    is_ipv6: bool,
+    options: &OutboundSocketOptions,
+    buffer_size: Option<usize>,
+) -> std::io::Result<tokio::net::UdpSocket> {
     validate_platform_options(options)?;
-    let socket = new_socket2_udp_socket(is_ipv6, options.bind_interface.clone(), None, false)?;
+    let socket = new_socket2_udp_socket_with_buffer_size(
+        is_ipv6,
+        options.bind_interface.clone(),
+        None,
+        false,
+        buffer_size,
+    )?;
     apply_routing_mark(&socket, options.routing_mark)?;
     let bind_address = options
         .bind_address(is_ipv6)
@@ -196,6 +233,159 @@ pub const fn supports_reuse_port() -> bool {
     ))
 }
 
+#[derive(Clone, Copy)]
+enum UdpBufferDirection {
+    Receive,
+    Send,
+}
+
+impl UdpBufferDirection {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Receive => "receive",
+            Self::Send => "send",
+        }
+    }
+
+    fn set(self, socket: &Socket, size: usize) -> std::io::Result<()> {
+        match self {
+            Self::Receive => socket.set_recv_buffer_size(size),
+            Self::Send => socket.set_send_buffer_size(size),
+        }
+    }
+
+    fn get(self, socket: &Socket) -> std::io::Result<usize> {
+        match self {
+            Self::Receive => socket.recv_buffer_size(),
+            Self::Send => socket.send_buffer_size(),
+        }
+    }
+
+    fn warn_once(self, warning: impl FnOnce()) {
+        static RECEIVE_WARNING: std::sync::Once = std::sync::Once::new();
+        static SEND_WARNING: std::sync::Once = std::sync::Once::new();
+
+        match self {
+            Self::Receive => RECEIVE_WARNING.call_once(warning),
+            Self::Send => SEND_WARNING.call_once(warning),
+        }
+    }
+}
+
+fn udp_buffer_is_large_enough(actual: usize, requested: usize) -> bool {
+    actual >= requested
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn force_udp_buffer_size(
+    socket: &Socket,
+    direction: UdpBufferDirection,
+    size: usize,
+) -> std::io::Result<()> {
+    let size = libc::c_int::try_from(size).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "UDP socket buffer size does not fit in c_int",
+        )
+    })?;
+    let option = match direction {
+        UdpBufferDirection::Receive => libc::SO_RCVBUFFORCE,
+        UdpBufferDirection::Send => libc::SO_SNDBUFFORCE,
+    };
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option,
+            std::ptr::from_ref(&size).cast(),
+            std::mem::size_of_val(&size) as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Best-effort socket-buffer setup for high-throughput UDP transports.
+///
+/// Linux silently caps a successful `SO_RCVBUF`/`SO_SNDBUF` call at the
+/// corresponding `net.core.*mem_max`. Verify the effective size and, when the
+/// process has `CAP_NET_ADMIN`, retry with the force option just as quic-go
+/// does. Socket creation remains best effort on every platform, but a capped
+/// buffer is no longer invisible to operators.
+fn configure_udp_buffer(socket: &Socket, direction: UdpBufferDirection, requested: usize) {
+    // Preserve an operator- or platform-provided buffer that already exceeds our
+    // target. Calling setsockopt unconditionally could silently shrink it.
+    if direction
+        .get(socket)
+        .is_ok_and(|actual| udp_buffer_is_large_enough(actual, requested))
+    {
+        return;
+    }
+
+    let set_error = direction.set(socket, requested).err();
+    let actual = direction.get(socket);
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let actual = if actual
+        .as_ref()
+        .is_ok_and(|actual| !udp_buffer_is_large_enough(*actual, requested))
+    {
+        // This commonly fails for an unprivileged process. The effective size
+        // below is authoritative, so keep this attempt quiet and emit one
+        // actionable warning only if the socket is still undersized.
+        let _ = force_udp_buffer_size(socket, direction, requested);
+        direction.get(socket)
+    } else {
+        actual
+    };
+
+    match actual {
+        Ok(actual) if udp_buffer_is_large_enough(actual, requested) => {}
+        Ok(actual) => {
+            direction.warn_once(|| {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                log::warn!(
+                    "UDP {} buffer is smaller than requested (wanted at least {} bytes, got {} bytes); high-throughput QUIC may drop packets. Increase net.core.{}mem_max or grant CAP_NET_ADMIN",
+                    direction.name(),
+                    requested,
+                    actual,
+                    if matches!(direction, UdpBufferDirection::Receive) {
+                        "r"
+                    } else {
+                        "w"
+                    },
+                );
+
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                log::warn!(
+                    "UDP {} buffer is smaller than requested (wanted at least {} bytes, got {} bytes); high-throughput QUIC may drop packets",
+                    direction.name(),
+                    requested,
+                    actual,
+                );
+            });
+        }
+        Err(error) => direction.warn_once(|| match set_error {
+            Some(set_error) => log::warn!(
+                "could not configure or verify UDP {} buffer after requesting {} bytes: setsockopt failed: {}; getsockopt failed: {}",
+                direction.name(),
+                requested,
+                set_error,
+                error,
+            ),
+            None => log::warn!(
+                "could not verify UDP {} buffer after requesting {} bytes: {}",
+                direction.name(),
+                requested,
+                error,
+            ),
+        }),
+    }
+}
+
 pub fn new_socket2_udp_socket_with_buffer_size(
     is_ipv6: bool,
     bind_interface: Option<String>,
@@ -211,9 +401,8 @@ pub fn new_socket2_udp_socket_with_buffer_size(
     // Set socket buffer sizes if specified.
     // This helps prevent packet drops during bursts for high-throughput connections.
     if let Some(size) = buffer_size {
-        // Ignore errors - kernel may cap the value
-        let _ = socket.set_recv_buffer_size(size);
-        let _ = socket.set_send_buffer_size(size);
+        configure_udp_buffer(&socket, UdpBufferDirection::Receive, size);
+        configure_udp_buffer(&socket, UdpBufferDirection::Send, size);
     }
 
     if reuse_port {
@@ -370,6 +559,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn udp_buffer_capacity_is_compared_to_the_requested_minimum() {
+        assert!(!udp_buffer_is_large_enough(
+            425_984,
+            QUIC_UDP_SOCKET_BUFFER_TARGET
+        ));
+        assert!(udp_buffer_is_large_enough(
+            QUIC_UDP_SOCKET_BUFFER_TARGET,
+            QUIC_UDP_SOCKET_BUFFER_TARGET
+        ));
+        assert!(udp_buffer_is_large_enough(
+            QUIC_UDP_SOCKET_BUFFER_TARGET * 2,
+            QUIC_UDP_SOCKET_BUFFER_TARGET
+        ));
+    }
+
+    #[test]
+    fn udp_socket_applies_a_reachable_buffer_request() {
+        let requested = 64 * 1024;
+        let socket = new_socket2_udp_socket_with_buffer_size(
+            false,
+            None,
+            Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            false,
+            Some(requested),
+        )
+        .unwrap();
+
+        assert!(socket.recv_buffer_size().unwrap() >= requested);
+        assert!(socket.send_buffer_size().unwrap() >= requested);
+    }
+
+    #[test]
+    fn udp_buffer_configuration_preserves_larger_existing_capacity() {
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        let receive_before = socket.recv_buffer_size().unwrap();
+        let send_before = socket.send_buffer_size().unwrap();
+
+        configure_udp_buffer(
+            &socket,
+            UdpBufferDirection::Receive,
+            (receive_before / 4).max(1),
+        );
+        configure_udp_buffer(&socket, UdpBufferDirection::Send, (send_before / 4).max(1));
+
+        assert!(socket.recv_buffer_size().unwrap() >= receive_before);
+        assert!(socket.send_buffer_size().unwrap() >= send_before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_force_udp_buffer_path_works_or_reports_missing_capability() {
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+
+        for direction in [UdpBufferDirection::Receive, UdpBufferDirection::Send] {
+            let before = direction.get(&socket).unwrap();
+            let requested = before.saturating_add(1);
+            match force_udp_buffer_size(&socket, direction, requested) {
+                Ok(()) => assert!(
+                    direction.get(&socket).unwrap() >= requested,
+                    "SO_{}BUFFORCE succeeded without applying the requested size",
+                    if matches!(direction, UdpBufferDirection::Receive) {
+                        "RCV"
+                    } else {
+                        "SND"
+                    },
+                ),
+                Err(error) => assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied,
+                    "the force option should either work or require CAP_NET_ADMIN",
+                ),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn outbound_tcp_and_udp_bind_configured_ipv4_source() {
         let options = OutboundSocketOptions {
@@ -389,6 +654,13 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST)
         );
         assert_ne!(udp.local_addr().unwrap().port(), 0);
+
+        let requested = 64 * 1024;
+        let buffered_udp =
+            new_outbound_udp_socket_with_buffer_size(false, &options, requested).unwrap();
+        let socket = socket2::SockRef::from(&buffered_udp);
+        assert!(socket.recv_buffer_size().unwrap() >= requested);
+        assert!(socket.send_buffer_size().unwrap() >= requested);
     }
 
     #[cfg(not(target_os = "linux"))]

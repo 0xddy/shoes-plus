@@ -3,12 +3,13 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::task::{Context, Poll};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use super::rate::RateLimiter;
+use super::rate::{RateLimiter, RatePermit, RateWaiter};
 
 #[derive(Default)]
 struct ActiveConnections {
@@ -256,17 +257,26 @@ impl UserContext {
         self.tx_limiter.set_rate(download_bps);
     }
 
-    /// Claims `n` bytes of download allowance, reporting how long the caller
-    /// must wait before sending them. Zero means "go ahead".
+    /// Poll for download allowance shared by every connection of this user.
     #[inline]
-    pub(super) fn reserve_tx(&self, n: u64) -> Duration {
-        self.tx_limiter.reserve(n)
+    pub(super) fn poll_acquire_tx<'a>(
+        &'a self,
+        waiter: &mut RateWaiter,
+        cx: &mut Context<'_>,
+        max_bytes: u64,
+    ) -> Poll<RatePermit<'a>> {
+        self.tx_limiter.poll_acquire(waiter, cx, max_bytes)
     }
 
-    /// Claims `n` bytes of upload allowance. See [`reserve_tx`](Self::reserve_tx).
+    /// Poll for upload allowance. See [`poll_acquire_tx`](Self::poll_acquire_tx).
     #[inline]
-    pub(super) fn reserve_rx(&self, n: u64) -> Duration {
-        self.rx_limiter.reserve(n)
+    pub(super) fn poll_acquire_rx<'a>(
+        &'a self,
+        waiter: &mut RateWaiter,
+        cx: &mut Context<'_>,
+        max_bytes: u64,
+    ) -> Poll<RatePermit<'a>> {
+        self.rx_limiter.poll_acquire(waiter, cx, max_bytes)
     }
 
     /// Whether one more connection would put this user over their ceiling.
@@ -530,6 +540,8 @@ pub struct UserStats {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]

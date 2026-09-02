@@ -184,7 +184,7 @@ struct TuicPreAuthAdmission {
 ///
 /// Wrapping the stream is what meters the UDP-over-uni-stream mode; the datagram
 /// mode has no stream to wrap and is counted explicitly through
-/// [`ConnContext::count_datagram_tx`] and its receiving counterpart.
+/// [`ConnContext::admit_datagram_tx`] and its receiving counterpart.
 type ClientStream = Box<dyn AsyncStream>;
 type ClientRecvStream = Box<dyn AsyncRead + Unpin + Send>;
 type ClientSendStream = Box<dyn AsyncWrite + Unpin + Send>;
@@ -430,6 +430,18 @@ async fn run_heartbeat_loop(
                 // Send heartbeat datagram: [version, command_heartbeat]
                 let heartbeat = bytes::Bytes::from_static(&[5, COMMAND_TYPE_HEARTBEAT]);
                 let heartbeat_len = heartbeat.len();
+                let permit = if let Some(meter) = &meter {
+                    Some(tokio::select! {
+                        biased;
+                        _ = cancel_token.cancelled() => return Ok(()),
+                        permit = meter.admit_datagram_tx(heartbeat_len) => permit,
+                    })
+                } else {
+                    None
+                };
+                if cancel_token.is_cancelled() {
+                    return Ok(());
+                }
                 if let Err(e) = connection.send_datagram(heartbeat) {
                     // Per sing-box reference, heartbeat failure should close the connection
                     return Err(std::io::Error::other(format!("heartbeat failed: {e}")));
@@ -438,8 +450,8 @@ async fn run_heartbeat_loop(
                 // counted on the way in -- `run_datagram_loop` bills a datagram before
                 // it looks at what kind it is. One rule for both directions is easier
                 // to state, and to test, than an exemption for keepalives.
-                if let Some(meter) = &meter {
-                    meter.count_datagram_tx(heartbeat_len).await;
+                if let Some(permit) = permit {
+                    permit.commit();
                 }
             }
         }
@@ -1902,17 +1914,28 @@ where
         datagram.extend_from_slice(&address_bytes);
         datagram.extend_from_slice(payload);
 
-        // Counted after the send, and by datagram length rather than payload
-        // length, so the session and address headers the client is charged for
-        // receiving are the ones actually put on the wire.
+        // Admission uses datagram length rather than payload length, so the
+        // session and address headers are charged only if Quinn accepts them.
         let datagram = datagram.freeze();
         let datagram_len = datagram.len();
         if !udp_response_send_allowed(cancel_token) {
             return Ok(());
         }
+        let permit = if let Some(meter) = meter {
+            Some(tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => return Ok(()),
+                permit = meter.admit_datagram_tx(datagram_len) => permit,
+            })
+        } else {
+            None
+        };
+        if !udp_response_send_allowed(cancel_token) {
+            return Ok(());
+        }
         send_datagram(0, datagram)?;
-        if let Some(meter) = meter {
-            meter.count_datagram_tx(datagram_len).await;
+        if let Some(permit) = permit {
+            permit.commit();
         }
     } else {
         // Calculate header sizes for first fragment and subsequent fragments.
@@ -1972,9 +1995,21 @@ where
             datagram.extend_from_slice(&payload[offset..offset + fragment_payload_len]);
             let datagram = datagram.freeze();
             let datagram_len = datagram.len();
+            let permit = if let Some(meter) = meter {
+                Some(tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => return Ok(()),
+                    permit = meter.admit_datagram_tx(datagram_len) => permit,
+                })
+            } else {
+                None
+            };
+            if !udp_response_send_allowed(cancel_token) {
+                return Ok(());
+            }
             send_datagram(fragment_id, datagram)?;
-            if let Some(meter) = meter {
-                meter.count_datagram_tx(datagram_len).await;
+            if let Some(permit) = permit {
+                permit.commit();
             }
             offset += fragment_payload_len;
         }
@@ -2935,12 +2970,20 @@ async fn run_datagram_loop(
             .await
             .map_err(|err| std::io::Error::other(format!("failed to read datagram: {err}")))?;
 
-        // Counted before any of the validation below, because every rejection past
-        // this point discards a datagram the client has already sent and this proxy
-        // has already received. Billing only the well-formed ones would let a client
-        // move bytes for free by malforming them.
+        // The datagram has left Quinn's receive queue, but waits for upload
+        // allowance before validation or forwarding. Cancellation while waiting
+        // deliberately discards it unbilled. Once admitted it is counted even if
+        // validation below rejects it, so malformed traffic is not free.
         if let Some(meter) = &meter {
-            meter.count_datagram_rx(data.len()).await;
+            let permit = tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => return Ok(()),
+                permit = meter.admit_datagram_rx(data.len()) => permit,
+            };
+            if cancel_token.is_cancelled() {
+                return Ok(());
+            }
+            permit.commit();
         }
 
         // Per official TUIC reference (handle_stream.rs:172-180), protocol errors close the connection
@@ -3112,8 +3155,8 @@ pub async fn start_tuic_server(
             // Lower initial RTT estimate for faster initial window growth
             .initial_rtt(Duration::from_millis(100));
 
-        // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
-        // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
+        // Request the platform-specific high-throughput QUIC buffer target in
+        // each direction; see socket_util for the OpenBSD exception.
         //
         // SO_REUSEPORT only when there is a second endpoint to share the port with:
         // platforms without it panic rather than fail.
@@ -3122,7 +3165,7 @@ pub async fn start_tuic_server(
             None,
             Some(bind_address),
             num_endpoints > 1,
-            Some(8_625_000),
+            Some(crate::socket_util::QUIC_UDP_SOCKET_BUFFER_TARGET),
         )?;
 
         quinn::Endpoint::new(
@@ -3225,6 +3268,7 @@ mod tests {
         AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
         AsyncWriteMessage,
     };
+    use crate::dynamic::{ConnContext, UserContext};
     use bytes::Bytes;
     use futures::future::{pending, poll_fn};
     use lru::LruCache;
@@ -4792,5 +4836,76 @@ mod tests {
         .unwrap();
 
         assert_eq!(writes, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metered_datagram_send_failure_and_cancellation_are_not_charged() {
+        const RATE_BPS: u64 = 8 * 64 * 1024;
+
+        let user = UserContext::new("alice");
+        user.set_speed_limits(0, RATE_BPS);
+        let conn = ConnContext::new();
+        assert!(conn.bind(Arc::clone(&user)));
+        let meter = Some(conn);
+        let source = location(53);
+        let payload = vec![0x5a; 65_000];
+
+        send_udp_datagram_fragments_with(
+            7,
+            &meter,
+            13,
+            &source,
+            &payload,
+            65_535,
+            &CancellationToken::new(),
+            |_fragment_id, _datagram| Err(std::io::Error::other("modeled send failure")),
+        )
+        .await
+        .expect_err("the modeled Quinn send must fail");
+        assert_eq!(user.tx(), 0);
+
+        let start = Instant::now();
+        let mut sent_len = 0;
+        send_udp_datagram_fragments_with(
+            7,
+            &meter,
+            14,
+            &source,
+            &payload,
+            65_535,
+            &CancellationToken::new(),
+            |_fragment_id, datagram| {
+                sent_len += datagram.len();
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(Instant::now(), start);
+        assert_eq!(user.tx(), sent_len as u64);
+
+        let cancel = CancellationToken::new();
+        let mut writes = 0;
+        {
+            let pending = send_udp_datagram_fragments_with(
+                7,
+                &meter,
+                15,
+                &source,
+                &payload,
+                65_535,
+                &cancel,
+                |_fragment_id, _datagram| {
+                    writes += 1;
+                    Ok(())
+                },
+            );
+            tokio::pin!(pending);
+            assert!(futures::poll!(pending.as_mut()).is_pending());
+            cancel.cancel();
+            pending.await.unwrap();
+        }
+        assert_eq!(writes, 0);
+        assert_eq!(user.tx(), sent_len as u64);
     }
 }

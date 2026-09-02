@@ -291,6 +291,22 @@ where
         }
         let datagram = datagram.freeze();
         let datagram_len = datagram.len();
+        let permit = if let Some(meter) = meter {
+            Some(tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => {
+                    return Ok(UdpResponseSendOutcome::Cancelled);
+                }
+                permit = meter.admit_datagram_tx(datagram_len) => permit,
+            })
+        } else {
+            None
+        };
+        // Cancellation can race with allowance becoming ready. Do not put the
+        // datagram on the wire in that case; dropping `permit` refunds it.
+        if !udp_response_send_allowed(cancel_token) {
+            return Ok(UdpResponseSendOutcome::Cancelled);
+        }
         match send_datagram(datagram) {
             Ok(()) => {}
             // A path-MTU change between the snapshot above and this write is a
@@ -310,8 +326,8 @@ where
                 )));
             }
         }
-        if let Some(meter) = meter {
-            meter.count_datagram_tx(datagram_len).await;
+        if let Some(permit) = permit {
+            permit.commit();
         }
     }
 
@@ -1528,12 +1544,20 @@ async fn run_udp_local_to_remote_loop(
             }
         };
 
-        // Counted before any of the validation below, because every one of those
-        // `continue`s discards a datagram the client has already sent and this proxy
-        // has already received. Billing only the well-formed ones would let a client
-        // move bytes for free by malforming them.
+        // The datagram has left Quinn's receive queue, but waits for upload
+        // allowance before validation or forwarding. Cancellation while waiting
+        // deliberately discards it unbilled. Once admitted it is counted even if
+        // validation below rejects it, so malformed traffic is not free.
         if let Some(meter) = &meter {
-            meter.count_datagram_rx(data.len()).await;
+            let permit = tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => return Ok(()),
+                permit = meter.admit_datagram_rx(data.len()) => permit,
+            };
+            if cancel_token.is_cancelled() {
+                return Ok(());
+            }
+            permit.commit();
         }
 
         // Per official hysteria reference (server.go:332-353), parse errors are ignored
@@ -2046,7 +2070,14 @@ pub async fn start_hysteria2_server(
             .keep_alive_interval(Some(Duration::from_secs(10)))
             .send_window(16 * 1024 * 1024)
             .receive_window((20u32 * 1024 * 1024).into())
-            .stream_receive_window((8u32 * 1024 * 1024).into())
+            // Quinn closes the connection when receive-buffer compaction still
+            // leaves more than 1024 chunks in one stream. A larger per-stream
+            // flow-control window lets a sustained upload retain more chunks
+            // behind missing data, increasing the chance of hitting that limit.
+            // Use Quinn's 1_250_000-byte default here as an empirical mitigation,
+            // not a proven safety bound. The 20 MiB connection window remains
+            // available to parallel streams.
+            .stream_receive_window(1_250_000u32.into())
             // MTU settings per official TUIC reference
             .initial_mtu(1200)
             .min_mtu(1200)
@@ -2064,8 +2095,8 @@ pub async fn start_hysteria2_server(
             // Lower initial RTT estimate for faster initial window growth
             .initial_rtt(Duration::from_millis(100));
 
-        // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
-        // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
+        // Request the platform-specific high-throughput QUIC buffer target in
+        // each direction; see socket_util for the OpenBSD exception.
         //
         // SO_REUSEPORT only when there is a second endpoint to share the port with:
         // platforms without it panic rather than fail.
@@ -2074,7 +2105,7 @@ pub async fn start_hysteria2_server(
             None,
             Some(bind_address),
             num_endpoints > 1,
-            Some(8_625_000),
+            Some(crate::socket_util::QUIC_UDP_SOCKET_BUFFER_TARGET),
         )?;
 
         // `wrap_udp_socket` lives on the Runtime trait.
@@ -2203,7 +2234,7 @@ mod tests {
     use crate::config::{
         ClientConfig, ClientProxyConfig, ClientQuicConfig, ConfigSelection, Transport,
     };
-    use crate::dynamic::{SelectorSlot, StaticUserRegistry};
+    use crate::dynamic::{ConnContext, SelectorSlot, StaticUserRegistry, UserContext};
     use crate::hysteria2_masquerade::Hysteria2Masquerade;
     use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
     use crate::resolver::{NativeResolver, Resolver};
@@ -2674,6 +2705,82 @@ mod tests {
                 .to_string()
                 .contains("datagrams not supported by peer")
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn datagram_send_failure_and_cancellation_refund_admission() {
+        const RATE_BPS: u64 = 8 * 64 * 1024;
+
+        let user = UserContext::new("alice");
+        user.set_speed_limits(0, RATE_BPS);
+        let conn = ConnContext::new();
+        assert!(conn.bind(Arc::clone(&user)));
+        let meter = Some(conn);
+        let source = location(53);
+        let payload = vec![0x5a; 65_000];
+
+        send_udp_response_with(
+            7,
+            &meter,
+            14,
+            &source,
+            &payload,
+            &CancellationToken::new(),
+            || Some(65_535),
+            |_datagram| Err(quinn::SendDatagramError::UnsupportedByPeer),
+        )
+        .await
+        .expect_err("the modeled Quinn send must fail");
+        assert_eq!(user.tx(), 0, "a failed send is not traffic");
+
+        // The failure returned its nearly full-burst permit, so retrying the
+        // same datagram does not wait for another second of credit.
+        let start = Instant::now();
+        let mut sent_len = 0;
+        let outcome = send_udp_response_with(
+            7,
+            &meter,
+            15,
+            &source,
+            &payload,
+            &CancellationToken::new(),
+            || Some(65_535),
+            |datagram| {
+                sent_len = datagram.len();
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, UdpResponseSendOutcome::Sent);
+        assert_eq!(Instant::now(), start);
+        assert_eq!(user.tx(), sent_len as u64);
+
+        // With the bucket now exhausted, cancellation wins while admission is
+        // pending. No closure call and no byte count may escape it.
+        let cancel = CancellationToken::new();
+        let mut writes = 0;
+        {
+            let pending = send_udp_response_with(
+                7,
+                &meter,
+                16,
+                &source,
+                &payload,
+                &cancel,
+                || Some(65_535),
+                |_datagram| {
+                    writes += 1;
+                    Ok(())
+                },
+            );
+            tokio::pin!(pending);
+            assert!(futures::poll!(pending.as_mut()).is_pending());
+            cancel.cancel();
+            assert_eq!(pending.await.unwrap(), UdpResponseSendOutcome::Cancelled);
+        }
+        assert_eq!(writes, 0);
+        assert_eq!(user.tx(), sent_len as u64);
     }
 
     #[test]

@@ -44,6 +44,10 @@ const MIN_ACK_RATE: f64 = 0.8;
 /// Scale the window by the reciprocal so that its wire pacing rate is Brutal's
 /// compensated target rather than 1.25 times that target.
 const QUINN_PACING_RECIPROCAL: f64 = 4.0 / 5.0;
+/// Quinn's strict send-window check needs room for two full datagrams plus the
+/// next-datagram boundary. Two datagrams are the receiver's normal immediate-ACK
+/// threshold; allowing only one falls onto the delayed-ACK timer.
+const MIN_CONGESTION_WINDOW_PACKETS: u64 = 3;
 
 /// Convert a configured Mbps value to Hysteria2's bytes-per-second wire unit.
 #[inline]
@@ -105,12 +109,11 @@ pub struct ServerNegotiation {
 
 /// Negotiate Hysteria2 congestion control for one authenticated connection.
 ///
-/// With `ignore_client_bandwidth=false`, the two directions stay independent. A
-/// zero client declaration keeps the server-to-client half on BBR, but the server
-/// still advertises `down_mbps` numerically. In particular, numeric zero means
-/// "uncapped" and lets a client with a configured upload rate select Brutal; it is
-/// deliberately different from the literal `auto`, which forces that client to BBR.
-/// This is the native Hysteria and legacy sing-quic wire behaviour.
+/// With `ignore_client_bandwidth=false`, a non-zero client declaration keeps the
+/// two directions independent: the server caps its Brutal sender with `up_mbps`
+/// and advertises `down_mbps` numerically. A zero declaration keeps both halves on
+/// bandwidth detection and returns the literal `auto`, matching the sing-quic
+/// service embedded by the Go node agent.
 ///
 /// With `ignore_client_bandwidth=true`, the client's declaration is ignored, both
 /// sides are instructed to retain bandwidth detection, and `up_mbps`/`down_mbps`
@@ -126,12 +129,17 @@ pub fn negotiate_server(
             send_bps: None,
             advertised_receive: AdvertisedReceive::Auto,
         }
-    } else {
+    } else if let Some(send_bps) = negotiated_send_bps(client_receive_bps, server_up_mbps) {
         ServerNegotiation {
-            send_bps: negotiated_send_bps(client_receive_bps, server_up_mbps),
+            send_bps: Some(send_bps),
             advertised_receive: AdvertisedReceive::BytesPerSecond(advertised_receive_bps(
                 server_down_mbps,
             )),
+        }
+    } else {
+        ServerNegotiation {
+            send_bps: None,
+            advertised_receive: AdvertisedReceive::Auto,
         }
     }
 }
@@ -238,14 +246,22 @@ impl NegotiatedBrutal {
         let pacing_window =
             compensated_rate * self.negotiation.rtt().as_secs_f64() * QUINN_PACING_RECIPROCAL;
 
-        // Quinn checks `in_flight + next_datagram >= window`; two MTUs guarantee
-        // that even a very low rate / RTT pair can make progress. Quinn's pacer
-        // refills at 5/4 window per RTT, hence the 4/5 above. sing-quic can set its
-        // pacer independently and keeps two BDPs of flight headroom; Quinn couples
-        // both knobs to `window`, so exact pacing leaves only 0.8 BDP of headroom.
-        // On a high-BDP path this can become ACK-clock constrained, but preserving
-        // the negotiated fixed rate is safer than silently sending 1.25x or 2.5x it.
-        (pacing_window as u64).max(self.current_mtu.saturating_mul(2))
+        // Quinn blocks when `in_flight + next_datagram >= window`. A 2-MTU
+        // window therefore admits only one full datagram, while QUIC normally
+        // sends an immediate ACK after the second. The sender would otherwise
+        // fall back to one packet per delayed-ACK timeout on low-RTT paths.
+        // Three MTUs are the smallest window that admits two full datagrams.
+        //
+        // Quinn's pacer refills at 5/4 window per RTT, hence the 4/5 above.
+        // sing-quic can set its pacer independently and keeps two BDPs of flight
+        // headroom; Quinn couples both knobs to `window`, so exact pacing leaves
+        // only 0.8 BDP of headroom. On a high-BDP path this can become ACK-clock
+        // constrained, but preserving the negotiated fixed rate is safer than
+        // silently sending 1.25x or 2.5x it.
+        (pacing_window as u64).max(
+            self.current_mtu
+                .saturating_mul(MIN_CONGESTION_WINDOW_PACKETS),
+        )
     }
 }
 
@@ -435,14 +451,14 @@ mod tests {
     }
 
     #[test]
-    fn server_negotiation_distinguishes_uncapped_from_auto() {
+    fn server_negotiation_matches_sing_quic_for_zero_client_receive_rate() {
         assert_eq!(
-            negotiate_server(0, 100, 0, false),
+            negotiate_server(0, 100, 200, false),
             ServerNegotiation {
                 send_bps: None,
-                advertised_receive: AdvertisedReceive::BytesPerSecond(0),
+                advertised_receive: AdvertisedReceive::Auto,
             },
-            "an RX=0 request keeps the server on BBR but advertises uncapped client upload"
+            "an RX=0 request keeps BBR in both directions"
         );
         assert_eq!(
             negotiate_server(8_000_000, 0, 37, false),
@@ -467,10 +483,10 @@ mod tests {
             "25000000"
         );
         assert_eq!(
-            negotiate_server(0, 100, 0, false)
+            negotiate_server(0, 100, 200, false)
                 .advertised_receive
                 .header_value(),
-            "0"
+            "auto"
         );
         assert_eq!(
             negotiate_server(8_000_000, 100, 200, true),
@@ -528,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn brutal_window_compensates_loss_and_never_deadlocks_below_one_packet() {
+    fn brutal_window_compensates_loss_and_avoids_the_delayed_ack_deadlock() {
         let factory = Arc::new(BrutalConfig);
         let now = Instant::now();
         let controller = factory.build(now, 1200);
@@ -553,7 +569,11 @@ mod tests {
         assert_eq!(negotiated.window(), 100_000);
 
         negotiated.activate(1, Duration::from_micros(1));
-        assert_eq!(negotiated.window(), 2400);
+        assert_eq!(negotiated.window(), 3600);
+        assert!(
+            2 * negotiated.current_mtu < negotiated.window(),
+            "Quinn's strict boundary must admit two full datagrams"
+        );
     }
 
     #[test]

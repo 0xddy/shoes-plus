@@ -806,17 +806,19 @@ pub enum ServerProxyConfig {
         up_mbps: u64,
         /// Server receive rate advertised to the client, in decimal Mbps.
         ///
-        /// This is negotiated independently from `up_mbps`. Unless client
-        /// bandwidth is ignored, zero is written as `Hysteria-CC-RX: 0`
-        /// (uncapped), including when the client advertises zero.
+        /// This is negotiated independently from `up_mbps` when the client
+        /// advertises a non-zero receive rate. A client advertising zero keeps
+        /// bandwidth detection in both directions, matching sing-quic, so the
+        /// response is `Hysteria-CC-RX: auto` and this value does not participate.
         #[serde(default)]
         down_mbps: u64,
         /// Ignore the bandwidth declared by the client and keep bandwidth
         /// detection (BBR) in both directions.
         ///
-        /// When false (the default), a numeric `Hysteria-CC-RX` response is
-        /// returned even when the configured receive rate is zero. Numeric zero
-        /// means uncapped; the literal `auto` is reserved for this option.
+        /// When false (the default), a non-zero client receive declaration gets a
+        /// numeric `Hysteria-CC-RX` response. Numeric zero means uncapped; a zero
+        /// client declaration still gets the literal `auto` for sing-quic
+        /// compatibility.
         #[serde(default, skip_serializing_if = "is_false")]
         ignore_client_bandwidth: bool,
         /// Salamander obfuscation, applied beneath QUIC.

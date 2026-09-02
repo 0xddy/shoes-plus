@@ -2,20 +2,18 @@
 //!
 //! # Where the bytes are counted
 //!
-//! [`TrafficMeterStream`] wraps a connection at the very bottom of the stack, as
-//! soon as it is accepted and before any protocol has looked at it. Everything the
-//! client sends or receives therefore passes through it exactly once: TLS records,
-//! WebSocket frames, protocol headers, padding, and the payload. That is the
-//! "wire bytes" figure an operator bills on, not the smaller payload-only figure.
+//! For byte-stream transports, [`TrafficMeterStream`] wraps the client-facing
+//! connection at the lowest layer the application owns. Bytes passing that layer
+//! are counted exactly once, including visible protocol headers and padding.
 //!
-//! Sitting at the bottom also means datagram protocols need no separate treatment.
-//! VLESS UDP, Trojan UDP, and XUDP all tunnel their datagrams over the same
-//! accepted connection, so their message streams are built *on top of* the meter
-//! and their bytes are already counted, fragmentation headers included.
+//! QUIC is the exception because Quinn owns the UDP socket and its packet framing.
+//! Hysteria2 and TUIC wrap each accepted logical stream and account for QUIC
+//! datagrams explicitly; those datagram counts include application headers but not
+//! Quinn's framing or AEAD overhead. Stream-tunneled protocols such as VLESS UDP,
+//! Trojan UDP, and XUDP need no separate path because they remain above the meter.
 //!
-//! Only the client side is metered. The stream this proxy opens to the target is
-//! deliberately left alone: it is not the user's traffic, and counting both would
-//! double every byte.
+//! Only client-facing traffic is metered. The stream this proxy opens to the target
+//! is deliberately left alone: counting both sides would double every byte.
 //!
 //! # Why the user is bound late
 //!
@@ -63,22 +61,21 @@
 //!
 //! One relaxed `fetch_add` per completed read and per completed write, on a cache
 //! line that belongs to one user (see [`UserContext`]'s layout), plus one relaxed
-//! atomic load to find that user. No locks, no allocation, and nothing that a
-//! config reload or a user being added can contend with.
+//! atomic load to find that user. Unlimited users take no limiter lock and allocate
+//! nothing. A limited user additionally enters its shared token bucket and lazily
+//! allocates per-stream wait state when the bucket is empty.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll};
-use std::time::Duration;
-
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::time::{Instant, Sleep};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use crate::async_stream::{AsyncPing, AsyncStream};
 
+use super::rate::{RatePermit, RateWaiter};
 use super::user::UserContext;
 
 tokio::task_local! {
@@ -106,6 +103,27 @@ pub struct ConnContext {
     /// observing a half-bound connection.
     registration: OnceLock<ConnectionRegistration>,
     cancellation: CancellationToken,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DatagramDirection {
+    Tx,
+    Rx,
+}
+
+/// Allowance for one complete QUIC datagram.
+///
+/// TX obtains this before handing a datagram to Quinn; RX obtains it after Quinn
+/// has received the datagram but before validation or forwarding. Dropping it
+/// returns every token, while [`commit`](Self::commit) records and charges the
+/// datagram once its direction-specific admission point succeeds.
+#[must_use = "dropping an uncommitted datagram permit refunds its allowance"]
+pub(crate) struct DatagramPermit<'a> {
+    conn: &'a ConnContext,
+    direction: DatagramDirection,
+    bytes: u64,
+    first: RatePermit<'a>,
+    additional: Vec<RatePermit<'a>>,
 }
 
 struct ConnectionRegistration {
@@ -269,53 +287,99 @@ impl ConnContext {
         self.bind_locked(Arc::clone(user), true, true)
     }
 
-    /// Count a datagram sent to the client, for a protocol whose datagrams never
-    /// pass through a [`TrafficMeterStream`].
+    /// Admit and account for QUIC datagrams, which never pass through a
+    /// [`TrafficMeterStream`].
     ///
     /// Hysteria2 and TUIC carry UDP over QUIC datagrams rather than over the stream
     /// the connection was accepted on, so there is nothing there to wrap: quinn owns
     /// the datagram, and the loop that builds one is the only place its size is
-    /// known. These two methods are that loop's way in.
+    /// known. The two directional methods below are that loop's way in.
     ///
     /// The figure is the datagram's own length, header and address included, but not
     /// the QUIC framing and AEAD tag quinn adds around it -- the same caveat every
     /// QUIC inbound's accounting carries.
-    /// The datagram is already gone by the time this is called -- quinn owns the
-    /// buffer and the send is not undoable -- so a bandwidth limit cannot hold
-    /// this one back. Awaiting here paces the *next* datagram instead, which
-    /// yields the right average rate over any window longer than one datagram.
-    pub async fn count_datagram_tx(&self, len: usize) {
-        self.add_tx(len as u64);
-        sleep_for(self.reserve_tx(len as u64)).await;
+    ///
+    /// Obtain download allowance before submitting a datagram to Quinn.
+    ///
+    /// A successful `send_datagram` must be followed by
+    /// [`DatagramPermit::commit`]. A send error, connection cancellation, or task
+    /// drop instead drops the permit and refunds all allowance without counting
+    /// bytes that never reached Quinn.
+    pub(crate) async fn admit_datagram_tx(&self, len: usize) -> DatagramPermit<'_> {
+        self.admit_datagram(len, DatagramDirection::Tx).await
     }
 
-    /// Count a datagram received from the client. See [`count_datagram_tx`].
+    /// Obtain upload allowance for a datagram Quinn has already received.
     ///
-    /// [`count_datagram_tx`]: ConnContext::count_datagram_tx
-    pub async fn count_datagram_rx(&self, len: usize) {
-        self.add_rx(len as u64);
-        sleep_for(self.reserve_rx(len as u64)).await;
+    /// Callers wait here before validating or forwarding it. If cancellation wins
+    /// while waiting, the datagram is discarded and this permit is never returned,
+    /// so it is deliberately neither charged nor counted. Once admitted, even a
+    /// malformed datagram is committed because it consumed receive capacity.
+    pub(crate) async fn admit_datagram_rx(&self, len: usize) -> DatagramPermit<'_> {
+        self.admit_datagram(len, DatagramDirection::Rx).await
     }
 
-    /// Claims download allowance for `n` bytes, reporting how long to wait.
-    ///
-    /// An unbound connection has no user and therefore no limit: bytes before
-    /// authentication are handshake overhead, they are not billed to anybody,
-    /// and throttling them would only slow down connection setup.
-    #[inline]
-    fn reserve_tx(&self, n: u64) -> Duration {
-        match self.registration.get() {
-            Some(registration) => registration.user.reserve_tx(n),
-            None => Duration::ZERO,
+    async fn admit_datagram(&self, len: usize, direction: DatagramDirection) -> DatagramPermit<'_> {
+        let bytes = len as u64;
+        let mut remaining = bytes;
+        let mut waiter = RateWaiter::default();
+        let first = std::future::poll_fn(|cx| match direction {
+            DatagramDirection::Tx => self.poll_acquire_tx(&mut waiter, cx, remaining),
+            DatagramDirection::Rx => self.poll_acquire_rx(&mut waiter, cx, remaining),
+        })
+        .await;
+        remaining -= first.granted();
+
+        // A QUIC datagram normally fits below the limiter's 4 KiB minimum burst,
+        // so this vector never allocates on real paths. Keeping the general case
+        // correct avoids undercharging if a future transport permits jumbo
+        // application datagrams.
+        let mut additional = Vec::new();
+        while remaining != 0 {
+            let permit = std::future::poll_fn(|cx| match direction {
+                DatagramDirection::Tx => self.poll_acquire_tx(&mut waiter, cx, remaining),
+                DatagramDirection::Rx => self.poll_acquire_rx(&mut waiter, cx, remaining),
+            })
+            .await;
+            remaining -= permit.granted();
+            additional.push(permit);
+        }
+
+        DatagramPermit {
+            conn: self,
+            direction,
+            bytes,
+            first,
+            additional,
         }
     }
 
-    /// Claims upload allowance for `n` bytes. See [`reserve_tx`](Self::reserve_tx).
+    /// Poll for download allowance. An unbound connection remains unlimited:
+    /// pre-authentication bytes are handshake overhead and belong to no user.
     #[inline]
-    fn reserve_rx(&self, n: u64) -> Duration {
+    fn poll_acquire_tx<'a>(
+        &'a self,
+        waiter: &mut RateWaiter,
+        cx: &mut Context<'_>,
+        max_bytes: u64,
+    ) -> Poll<RatePermit<'a>> {
         match self.registration.get() {
-            Some(registration) => registration.user.reserve_rx(n),
-            None => Duration::ZERO,
+            Some(registration) => registration.user.poll_acquire_tx(waiter, cx, max_bytes),
+            None => Poll::Ready(RatePermit::unlimited(max_bytes)),
+        }
+    }
+
+    /// Poll for upload allowance. See [`poll_acquire_tx`](Self::poll_acquire_tx).
+    #[inline]
+    fn poll_acquire_rx<'a>(
+        &'a self,
+        waiter: &mut RateWaiter,
+        cx: &mut Context<'_>,
+        max_bytes: u64,
+    ) -> Poll<RatePermit<'a>> {
+        match self.registration.get() {
+            Some(registration) => registration.user.poll_acquire_rx(waiter, cx, max_bytes),
+            None => Poll::Ready(RatePermit::unlimited(max_bytes)),
         }
     }
 
@@ -366,6 +430,32 @@ impl ConnContext {
             registration
                 .user
                 .add_rx(self.pending_rx.swap(0, Ordering::Relaxed));
+        }
+    }
+}
+
+impl DatagramPermit<'_> {
+    /// Mark the admitted datagram as accepted by Quinn (TX) or accepted for
+    /// processing (RX), charging every granted token and updating accounting.
+    pub(crate) fn commit(self) {
+        let Self {
+            conn,
+            direction,
+            bytes,
+            first,
+            additional,
+        } = self;
+
+        let first_bytes = first.granted();
+        first.commit(first_bytes);
+        for permit in additional {
+            let granted = permit.granted();
+            permit.commit(granted);
+        }
+
+        match direction {
+            DatagramDirection::Tx => conn.add_tx(bytes),
+            DatagramDirection::Rx => conn.add_rx(bytes),
         }
     }
 }
@@ -469,22 +559,18 @@ where
 
 /// A stream that counts every byte that actually crosses it.
 ///
-/// Reads and writes are forwarded unchanged; the only additions are a relaxed
-/// `fetch_add` on each one that completes. Nothing is counted for a `Poll::Pending`
-/// or an error, so the totals reflect bytes that reached the socket rather than
-/// bytes that were offered to it.
+/// Unlimited reads and writes are forwarded unchanged. A limited user first
+/// obtains shared allowance, then the I/O poll is capped to that allowance.
+/// Nothing is counted for `Poll::Pending` or an error, so totals still reflect
+/// bytes that reached the socket rather than bytes that were merely offered.
 pub struct TrafficMeterStream<T> {
     inner: T,
     conn: Arc<ConnContext>,
     cancellation: Pin<Box<WaitForCancellationFutureOwned>>,
-    /// Bandwidth debt owed before the next read may be issued, if any.
-    ///
-    /// One slot per direction, and per *stream* rather than per user: the bucket
-    /// is shared, but each stream needs somewhere to register its own waker.
-    /// Allocated lazily, so an unlimited user never pays for a timer.
-    read_delay: Option<Pin<Box<Sleep>>>,
-    /// Bandwidth debt owed before the next write may be issued, if any.
-    write_delay: Option<Pin<Box<Sleep>>>,
+    /// Per-stream timer/notification state. It owns no shared reservation, so
+    /// dropping the stream while it waits cannot leave rate debt behind.
+    read_waiter: RateWaiter,
+    write_waiter: RateWaiter,
 }
 
 impl<T> TrafficMeterStream<T> {
@@ -494,8 +580,8 @@ impl<T> TrafficMeterStream<T> {
             inner,
             conn,
             cancellation,
-            read_delay: None,
-            write_delay: None,
+            read_waiter: RateWaiter::default(),
+            write_waiter: RateWaiter::default(),
         }
     }
 
@@ -509,41 +595,6 @@ impl<T> TrafficMeterStream<T> {
         } else {
             Ok(())
         }
-    }
-}
-
-/// Waits out a reservation. A zero delay does not touch the timer wheel.
-async fn sleep_for(delay: Duration) {
-    if !delay.is_zero() {
-        tokio::time::sleep(delay).await;
-    }
-}
-
-/// Polls an armed delay, clearing it once it fires.
-///
-/// `Ready` means the direction is clear to proceed.
-fn poll_delay(slot: &mut Option<Pin<Box<Sleep>>>, cx: &mut Context<'_>) -> Poll<()> {
-    let Some(sleep) = slot.as_mut() else {
-        return Poll::Ready(());
-    };
-    match sleep.as_mut().poll(cx) {
-        Poll::Ready(()) => {
-            *slot = None;
-            Poll::Ready(())
-        }
-        Poll::Pending => Poll::Pending,
-    }
-}
-
-/// Arms a delay, reusing the existing timer rather than allocating a new one.
-fn arm_delay(slot: &mut Option<Pin<Box<Sleep>>>, delay: Duration) {
-    if delay.is_zero() {
-        return;
-    }
-    let deadline = Instant::now() + delay;
-    match slot.as_mut() {
-        Some(sleep) => sleep.as_mut().reset(deadline),
-        None => *slot = Some(Box::pin(tokio::time::sleep_until(deadline))),
     }
 }
 
@@ -563,6 +614,43 @@ impl<T: std::fmt::Debug> std::fmt::Debug for TrafficMeterStream<T> {
     }
 }
 
+/// Poll a reader without letting it consume more than `limit` bytes. The
+/// temporary `ReadBuf` must propagate both initialization and filled length back
+/// to its parent; callers are allowed to provide uninitialized storage.
+fn poll_read_limited<T: AsyncRead + Unpin>(
+    inner: &mut T,
+    cx: &mut Context<'_>,
+    buf: &mut ReadBuf<'_>,
+    limit: usize,
+) -> (Poll<std::io::Result<()>>, u64) {
+    let remaining = buf.remaining();
+    if limit >= remaining {
+        let before = buf.filled().len();
+        let result = Pin::new(inner).poll_read(cx, buf);
+        let read = match result {
+            Poll::Ready(Ok(())) => (buf.filled().len() - before) as u64,
+            _ => 0,
+        };
+        return (result, read);
+    }
+
+    let (result, initialized, filled) = {
+        let mut limited = buf.take(limit);
+        let result = Pin::new(inner).poll_read(cx, &mut limited);
+        (result, limited.initialized().len(), limited.filled().len())
+    };
+    // SAFETY: the inner AsyncRead reported this prefix initialized through the
+    // child ReadBuf above.
+    unsafe { buf.assume_init(initialized) };
+    let read = if matches!(result, Poll::Ready(Ok(()))) {
+        buf.advance(filled);
+        filled as u64
+    } else {
+        0
+    };
+    (result, read)
+}
+
 impl<T: AsyncRead + Unpin> AsyncRead for TrafficMeterStream<T> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -573,21 +661,23 @@ impl<T: AsyncRead + Unpin> AsyncRead for TrafficMeterStream<T> {
         if let Err(error) = this.poll_cancelled(cx) {
             return Poll::Ready(Err(error));
         }
-        // Debt from the previous read is paid before another one is issued. The
-        // bytes already handed to the caller cannot be taken back, so the pause
-        // lands here instead -- which also lets TCP flow control do the actual
-        // work of slowing the peer down, rather than buffering on our side.
-        if poll_delay(&mut this.read_delay, cx).is_pending() {
-            return Poll::Pending;
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
         }
-        // `poll_read` reports success by having grown the filled region, so the
-        // delta is the only way to learn how much arrived.
-        let before = buf.filled().len();
-        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
-        if result.is_ready() {
-            let read = (buf.filled().len() - before) as u64;
-            this.conn.add_rx(read);
-            arm_delay(&mut this.read_delay, this.conn.reserve_rx(read));
+
+        let Self {
+            inner,
+            conn,
+            read_waiter,
+            ..
+        } = this;
+        let permit =
+            std::task::ready!(conn.poll_acquire_rx(read_waiter, cx, buf.remaining() as u64,));
+        let limit = permit.granted() as usize;
+        let (result, read) = poll_read_limited(inner, cx, buf, limit);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            permit.commit(read);
+            conn.add_rx(read);
         }
         result
     }
@@ -603,13 +693,22 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TrafficMeterStream<T> {
         if let Err(error) = this.poll_cancelled(cx) {
             return Poll::Ready(Err(error));
         }
-        if poll_delay(&mut this.write_delay, cx).is_pending() {
-            return Poll::Pending;
+        if buf.is_empty() {
+            return Pin::new(&mut this.inner).poll_write(cx, buf);
         }
-        let result = Pin::new(&mut this.inner).poll_write(cx, buf);
+
+        let Self {
+            inner,
+            conn,
+            write_waiter,
+            ..
+        } = this;
+        let permit = std::task::ready!(conn.poll_acquire_tx(write_waiter, cx, buf.len() as u64,));
+        let limit = permit.granted() as usize;
+        let result = Pin::new(inner).poll_write(cx, &buf[..limit]);
         if let Poll::Ready(Ok(n)) = result {
-            this.conn.add_tx(n as u64);
-            arm_delay(&mut this.write_delay, this.conn.reserve_tx(n as u64));
+            permit.commit(n as u64);
+            conn.add_tx(n as u64);
         }
         result
     }
@@ -642,13 +741,41 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TrafficMeterStream<T> {
         if let Err(error) = this.poll_cancelled(cx) {
             return Poll::Ready(Err(error));
         }
-        if poll_delay(&mut this.write_delay, cx).is_pending() {
-            return Poll::Pending;
+        let requested = bufs
+            .iter()
+            .fold(0usize, |total, buf| total.saturating_add(buf.len()));
+        if requested == 0 {
+            return Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
         }
-        let result = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+
+        let Self {
+            inner,
+            conn,
+            write_waiter,
+            ..
+        } = this;
+        let permit = std::task::ready!(conn.poll_acquire_tx(write_waiter, cx, requested as u64,));
+        let limit = permit.granted() as usize;
+        let result = if limit >= requested {
+            Pin::new(inner).poll_write_vectored(cx, bufs)
+        } else {
+            let mut remaining = limit;
+            let mut limited = Vec::with_capacity(bufs.len());
+            for buf in bufs {
+                if remaining == 0 {
+                    break;
+                }
+                let len = remaining.min(buf.len());
+                if len != 0 {
+                    limited.push(std::io::IoSlice::new(&buf[..len]));
+                    remaining -= len;
+                }
+            }
+            Pin::new(inner).poll_write_vectored(cx, &limited)
+        };
         if let Poll::Ready(Ok(n)) = result {
-            this.conn.add_tx(n as u64);
-            arm_delay(&mut this.write_delay, this.conn.reserve_tx(n as u64));
+            permit.commit(n as u64);
+            conn.add_tx(n as u64);
         }
         result
     }
@@ -678,6 +805,8 @@ impl<T: AsyncStream> AsyncStream for TrafficMeterStream<T> {}
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     use super::*;
@@ -701,6 +830,118 @@ mod tests {
 
         assert_eq!((user.rx(), user.tx()), (10, 3));
         assert_eq!(conn.pending(), (0, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_read_refunds_its_pre_io_allowance() {
+        const RATE_BPS: u64 = 1_000_000;
+        const BURST: usize = 125_000;
+
+        let user = UserContext::new("alice");
+        user.set_speed_limits(RATE_BPS, 0);
+        let conn = ConnContext::new();
+        assert!(conn.bind(Arc::clone(&user)));
+
+        // The first stream has no data. Its read obtains allowance before
+        // polling the duplex and must return that allowance when the duplex is
+        // Pending.
+        let (_empty_peer, empty_local) = tokio::io::duplex(BURST + 1);
+        let mut empty_stream = TrafficMeterStream::new(empty_local, Arc::clone(&conn));
+        let mut attempt = [0u8; 4096];
+        {
+            let mut read = Box::pin(empty_stream.read_exact(&mut attempt));
+            assert!(futures::poll!(read.as_mut()).is_pending());
+        }
+        assert_eq!(user.rx(), 0, "a Pending read must not be charged");
+
+        // A different stream can still spend the complete opening burst. If
+        // the first permit leaked, this read would have to wait for its tail.
+        let (mut peer, local) = tokio::io::duplex(BURST + 1);
+        peer.write_all(&vec![0x5a; BURST]).await.unwrap();
+        let mut stream = TrafficMeterStream::new(local, Arc::clone(&conn));
+        let mut received = vec![0u8; BURST];
+        let start = tokio::time::Instant::now();
+        stream.read_exact(&mut received).await.unwrap();
+        assert_eq!(tokio::time::Instant::now(), start);
+        assert_eq!(user.rx(), BURST as u64);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_an_upload_waiter_leaves_no_debt_for_another_stream() {
+        const RATE_BPS: u64 = 1_000_000;
+        const BURST: usize = 125_000;
+
+        let user = UserContext::new("alice");
+        user.set_speed_limits(RATE_BPS, 0);
+        let conn = ConnContext::new();
+        assert!(conn.bind(Arc::clone(&user)));
+
+        let (mut opening_peer, opening_local) = tokio::io::duplex(BURST + 1);
+        opening_peer.write_all(&vec![0x11; BURST]).await.unwrap();
+        let mut opening_stream = TrafficMeterStream::new(opening_local, Arc::clone(&conn));
+        let mut opening = vec![0u8; BURST];
+        opening_stream.read_exact(&mut opening).await.unwrap();
+        assert_eq!(user.rx(), BURST as u64);
+
+        // Data is ready underneath, but the exhausted shared bucket prevents
+        // the wrapper from reading it. Cancelling this future and dropping its
+        // stream must not enqueue a 32 KiB reservation for the future.
+        let (mut blocked_peer, blocked_local) = tokio::io::duplex(32 * 1024 + 1);
+        blocked_peer
+            .write_all(&vec![0x22; 32 * 1024])
+            .await
+            .unwrap();
+        let mut blocked_stream = TrafficMeterStream::new(blocked_local, Arc::clone(&conn));
+        let mut blocked_buf = vec![0u8; 32 * 1024];
+        {
+            let mut read = Box::pin(blocked_stream.read_exact(&mut blocked_buf));
+            assert!(futures::poll!(read.as_mut()).is_pending());
+        }
+        assert_eq!(
+            user.rx(),
+            BURST as u64,
+            "rate waiting must happen before bytes leave the socket"
+        );
+        drop(blocked_stream);
+
+        let (mut probe_peer, probe_local) = tokio::io::duplex(1025);
+        probe_peer.write_all(&vec![0x33; 1024]).await.unwrap();
+        let mut probe_stream = TrafficMeterStream::new(probe_local, Arc::clone(&conn));
+        let mut probe = [0u8; 1024];
+        let start = tokio::time::Instant::now();
+        probe_stream.read_exact(&mut probe).await.unwrap();
+        let elapsed = tokio::time::Instant::now().duration_since(start);
+        let ideal = Duration::from_micros(8192);
+        assert!(
+            (ideal..=ideal + Duration::from_millis(1)).contains(&elapsed),
+            "the canceled stream delayed a 1 KiB probe by {elapsed:?}"
+        );
+        assert_eq!(user.rx(), BURST as u64 + 1024);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn datagram_permits_count_only_on_commit_and_refund_on_drop() {
+        const RATE_BPS: u64 = 8 * 64 * 1024;
+        const DATAGRAM: usize = 64 * 1024;
+
+        let user = UserContext::new("alice");
+        user.set_speed_limits(RATE_BPS, RATE_BPS);
+        let conn = ConnContext::new();
+        assert!(conn.bind(Arc::clone(&user)));
+
+        let tx = conn.admit_datagram_tx(DATAGRAM).await;
+        assert_eq!(user.tx(), 0, "admission alone is not a successful send");
+        drop(tx);
+        let tx = conn.admit_datagram_tx(DATAGRAM).await;
+        tx.commit();
+        assert_eq!(user.tx(), DATAGRAM as u64);
+
+        let rx = conn.admit_datagram_rx(DATAGRAM).await;
+        assert_eq!(user.rx(), 0, "admission alone is not accepted input");
+        drop(rx);
+        let rx = conn.admit_datagram_rx(DATAGRAM).await;
+        rx.commit();
+        assert_eq!(user.rx(), DATAGRAM as u64);
     }
 
     #[tokio::test]
@@ -863,11 +1104,15 @@ mod tests {
         assert_eq!(alice.total_conns(), 1);
         assert!(conn.registration.get().is_none());
         assert!(!conn.cancellation.is_cancelled());
+        let mut waiter = RateWaiter::default();
+        let permit =
+            std::future::poll_fn(|cx| conn.poll_acquire_rx(&mut waiter, cx, 4 * 1024 * 1024)).await;
         assert_eq!(
-            conn.reserve_rx(4 * 1024 * 1024),
-            Duration::ZERO,
+            permit.granted(),
+            4 * 1024 * 1024,
             "anonymous fallback bytes must not consume alice's rate bucket"
         );
+        permit.commit(4 * 1024 * 1024);
 
         // A metered fallback can still move bytes, but without attributing them to
         // the credential whose admission was refused.
