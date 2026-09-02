@@ -973,7 +973,7 @@ async fn start_tcp_or_quic_servers(
     if handle.listener_count() == 0 {
         return Err(std::io::Error::other(format!(
             "failed to start servers at {}",
-            &config.bind_location
+            config.bind_location
         )));
     }
 
@@ -1004,7 +1004,7 @@ async fn start_tcp_servers(
         ..
     } = config;
 
-    println!("Starting {} TCP server at {}", &protocol, &bind_location);
+    println!("Starting {} TCP server at {}", protocol, bind_location);
 
     // Traffic is only counted for an inbound whose users the caller manages: those
     // are the only `UserContext`s anyone can read the counters off. A config-file

@@ -906,7 +906,7 @@ pub(crate) async fn start_quic_servers_with_resolved_bind(
         ..
     } = config;
 
-    println!("Starting {} QUIC server at {}", &protocol, &bind_location);
+    println!("Starting {} QUIC server at {}", protocol, bind_location);
 
     // See `start_tcp_servers`: only an inbound whose users the caller manages has
     // counters anyone can read.

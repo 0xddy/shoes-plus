@@ -1096,7 +1096,9 @@ fn decode_hex(value: &[u8], context: &str) -> io::Result<Vec<u8>> {
         )));
     }
     value
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = hex_digit(pair[0]).ok_or_else(|| {
                 invalid_record(format!("{context} contains non-hexadecimal data"))
