@@ -98,48 +98,82 @@ impl AdvertisedReceive {
     }
 }
 
-/// Both directions negotiated by a Hysteria2 server for one auth request.
+/// What a Hysteria2 server decides for one auth request.
+///
+/// A direct port of `serverSession.ServeHTTP` in sing-quic's
+/// `hysteria2/service.go`, including its refusal case -- the Go service answers an
+/// unacceptable bandwidth declaration with the masquerade rather than a protocol
+/// error, so a probe cannot tell a Hysteria2 server from the site it impersonates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ServerNegotiation {
-    /// Controller for packets sent by the server. `None` retains BBR.
-    pub send_bps: Option<u64>,
-    /// Instruction for the controller sending packets toward the server.
-    pub advertised_receive: AdvertisedReceive,
+pub enum ServerNegotiation {
+    /// Do not authenticate: serve the masquerade handler instead.
+    ServeMasquerade,
+    /// Authenticate, having decided both directions.
+    Accept {
+        /// Controller for packets sent by the server. `None` retains BBR.
+        send_bps: Option<u64>,
+        /// Instruction for the controller sending packets toward the server.
+        advertised_receive: AdvertisedReceive,
+    },
 }
 
 /// Negotiate Hysteria2 congestion control for one authenticated connection.
 ///
-/// With `ignore_client_bandwidth=false`, a non-zero client declaration keeps the
-/// two directions independent: the server caps its Brutal sender with `up_mbps`
-/// and advertises `down_mbps` numerically. A zero declaration keeps both halves on
-/// bandwidth detection and returns the literal `auto`, matching the sing-quic
-/// service embedded by the Go node agent.
+/// The three branches are sing-quic's, in its order, with its comparisons:
 ///
-/// With `ignore_client_bandwidth=true`, the client's declaration is ignored, both
-/// sides are instructed to retain bandwidth detection, and `up_mbps`/`down_mbps`
-/// do not participate in the exchange.
+/// ```text
+/// if receiveBPS > 0 && ignoreClientBandwidth && clientRx == 0  -> masquerade
+/// else if !(receiveBPS == 0 && ignoreClientBandwidth) && clientRx > 0
+///                                                             -> Brutal(min(clientRx, sendBPS))
+/// else                                                        -> BBR, and answer "auto"
+/// ```
+///
+/// Two consequences are easy to get wrong by reasoning from the field names instead
+/// of from that code, and both were wrong here before:
+///
+/// * `auto` is not a property of the *receive* rate. It is emitted whenever the
+///   server picks BBR for its own send half, and it *replaces* the numeric rate in
+///   `Hysteria-CC-RX`. Answering a numeric `0` there instead means "no limit", which
+///   a client with a configured upload rate reads as permission to run Brutal at
+///   that rate -- the opposite instruction, on the upload half, from a server that
+///   meant to ask for bandwidth detection.
+/// * `ignore_client_bandwidth` does not mean "always use BBR". It only suppresses
+///   the client's declaration when no receive rate is configured; with one
+///   configured it still selects Brutal, and a client that declines to declare a
+///   rate at all is refused.
 pub fn negotiate_server(
     client_receive_bps: u64,
     server_up_mbps: u64,
     server_down_mbps: u64,
     ignore_client_bandwidth: bool,
 ) -> ServerNegotiation {
-    if ignore_client_bandwidth {
-        ServerNegotiation {
-            send_bps: None,
-            advertised_receive: AdvertisedReceive::Auto,
-        }
-    } else if let Some(send_bps) = negotiated_send_bps(client_receive_bps, server_up_mbps) {
-        ServerNegotiation {
-            send_bps: Some(send_bps),
-            advertised_receive: AdvertisedReceive::BytesPerSecond(advertised_receive_bps(
-                server_down_mbps,
-            )),
-        }
-    } else {
-        ServerNegotiation {
-            send_bps: None,
-            advertised_receive: AdvertisedReceive::Auto,
+    let receive_bps = advertised_receive_bps(server_down_mbps);
+
+    if receive_bps > 0 && ignore_client_bandwidth && client_receive_bps == 0 {
+        return ServerNegotiation::ServeMasquerade;
+    }
+
+    if !(receive_bps == 0 && ignore_client_bandwidth) && client_receive_bps > 0 {
+        return ServerNegotiation::Accept {
+            send_bps: negotiated_send_bps(client_receive_bps, server_up_mbps),
+            advertised_receive: AdvertisedReceive::BytesPerSecond(receive_bps),
+        };
+    }
+
+    ServerNegotiation::Accept {
+        send_bps: None,
+        advertised_receive: AdvertisedReceive::Auto,
+    }
+}
+
+impl ServerNegotiation {
+    #[cfg(test)]
+    fn header_value_for_test(self) -> String {
+        match self {
+            Self::ServeMasquerade => "<masquerade>".to_string(),
+            Self::Accept {
+                advertised_receive, ..
+            } => advertised_receive.header_value(),
         }
     }
 }
@@ -450,54 +484,66 @@ mod tests {
         assert_eq!(advertised_receive_bps(37), 4_625_000);
     }
 
+    /// Every branch of `serverSession.ServeHTTP` in sing-quic's `hysteria2/service.go`,
+    /// named by the configuration that reaches it.
     #[test]
-    fn server_negotiation_matches_sing_quic_for_zero_client_receive_rate() {
+    fn server_negotiation_ports_every_sing_quic_branch() {
+        let accept = |send_bps, advertised_receive| ServerNegotiation::Accept {
+            send_bps,
+            advertised_receive,
+        };
+
+        // else-branch: no client declaration, so both halves keep bandwidth
+        // detection and the answer is the literal `auto`, not a numeric rate. This
+        // is the shape a client that configures no bandwidth negotiates, and
+        // answering `0` here instead would invite it to run Brutal on its upload.
         assert_eq!(
             negotiate_server(0, 100, 200, false),
-            ServerNegotiation {
-                send_bps: None,
-                advertised_receive: AdvertisedReceive::Auto,
-            },
-            "an RX=0 request keeps BBR in both directions"
-        );
-        assert_eq!(
-            negotiate_server(8_000_000, 0, 37, false),
-            ServerNegotiation {
-                send_bps: Some(8_000_000),
-                advertised_receive: AdvertisedReceive::BytesPerSecond(4_625_000),
-            },
-            "an absent server upload cap leaves the client's rate intact"
-        );
-        assert_eq!(
-            negotiate_server(20_000_000, 100, 0, false),
-            ServerNegotiation {
-                send_bps: Some(12_500_000),
-                advertised_receive: AdvertisedReceive::BytesPerSecond(0),
-            },
-            "the upload cap and numeric zero in the opposite direction are independent"
-        );
-        assert_eq!(
-            negotiate_server(8_000_000, 100, 200, false)
-                .advertised_receive
-                .header_value(),
-            "25000000"
+            accept(None, AdvertisedReceive::Auto),
         );
         assert_eq!(
             negotiate_server(0, 100, 200, false)
-                .advertised_receive
-                .header_value(),
-            "auto"
+                .header_value_for_test(),
+            "auto",
+        );
+        assert_eq!(negotiate_server(0, 0, 0, false), accept(None, AdvertisedReceive::Auto));
+
+        // Brutal branch: a declared client rate, capped by `up_mbps` only when one
+        // is configured, while the opposite direction is advertised numerically and
+        // independently -- numeric zero included.
+        assert_eq!(
+            negotiate_server(8_000_000, 0, 37, false),
+            accept(Some(8_000_000), AdvertisedReceive::BytesPerSecond(4_625_000)),
+            "an absent server upload cap leaves the client's rate intact",
         );
         assert_eq!(
+            negotiate_server(20_000_000, 100, 0, false),
+            accept(Some(12_500_000), AdvertisedReceive::BytesPerSecond(0)),
+            "the upload cap and numeric zero in the opposite direction are independent",
+        );
+        assert_eq!(
+            negotiate_server(8_000_000, 100, 200, false)
+                .header_value_for_test(),
+            "25000000",
+        );
+
+        // `ignore_client_bandwidth` is not "always BBR". With no receive rate
+        // configured it suppresses the declaration...
+        assert_eq!(
+            negotiate_server(8_000_000, 100, 0, true),
+            accept(None, AdvertisedReceive::Auto),
+        );
+        // ...but with one configured, a declared rate still selects Brutal...
+        assert_eq!(
             negotiate_server(8_000_000, 100, 200, true),
-            ServerNegotiation {
-                send_bps: None,
-                advertised_receive: AdvertisedReceive::Auto,
-            },
-            "ignoring client bandwidth keeps both directions on bandwidth detection"
+            accept(Some(8_000_000), AdvertisedReceive::BytesPerSecond(25_000_000)),
+        );
+        // ...and a client that declares nothing is refused, by masquerade.
+        assert_eq!(
+            negotiate_server(0, 100, 200, true),
+            ServerNegotiation::ServeMasquerade,
         );
     }
-
     #[test]
     fn loss_compensation_matches_the_go_sampling_rules() {
         let epoch = Instant::now();

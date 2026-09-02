@@ -74,7 +74,13 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 /// connection may process concurrently. Quinn advertises the same ceiling, and
 /// the application semaphore keeps DNS/connect/copy work inside it even after a
 /// peer has finished its sending half of a stream.
-const MAX_ACTIVE_TCP_LOGICAL_FLOWS: usize = 256;
+const MAX_ACTIVE_TCP_LOGICAL_FLOWS: usize = 1024;
+
+/// How far above [`MAX_ACTIVE_TCP_LOGICAL_FLOWS`] the advertised QUIC stream ceiling
+/// sits. Same reasoning as the Hysteria2 listener's constant of this name: when the
+/// two are equal the application backstop can never fire, and a peer at the ceiling
+/// sees `open_bi` block with no error rather than a refusal it can act on.
+const ADVERTISED_BIDI_STREAM_HEADROOM: u32 = 64;
 
 /// Absolute time allowed to deliver one TUIC CONNECT header after its QUIC stream
 /// is accepted. Incremental reads never renew it.
@@ -3138,7 +3144,10 @@ pub async fn start_tuic_server(
 
         Arc::get_mut(&mut server_config.transport)
             .unwrap()
-            .max_concurrent_bidi_streams((MAX_ACTIVE_TCP_LOGICAL_FLOWS as u32).into())
+            .max_concurrent_bidi_streams(
+                (MAX_ACTIVE_TCP_LOGICAL_FLOWS as u32 + ADVERTISED_BIDI_STREAM_HEADROOM)
+                    .into(),
+            )
             .max_concurrent_uni_streams(4096_u32.into())
             .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()))
             .keep_alive_interval(Some(Duration::from_secs(15)))

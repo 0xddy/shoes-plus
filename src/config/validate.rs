@@ -13,7 +13,6 @@ use crate::option_util::{NoneOrSome, OneOrSome};
 use crate::reality::{decode_private_key, decode_short_id};
 use crate::routing::srs::{SrsDefaultRule, SrsLogicalMode, SrsRule, SrsRuleSet, parse_bytes_named};
 use crate::socket_util::supports_reuse_port;
-use crate::thread_util::get_num_threads;
 use crate::uuid_util::parse_uuid;
 
 use super::pem::{embed_optional_pem_from_map, embed_pem_from_map};
@@ -1369,22 +1368,39 @@ fn validate_server_config(
             }) => {
                 validate_client_fingerprints(client_fingerprints)?;
 
-                // One endpoint per thread, but only where several sockets can share a
-                // UDP port. Without SO_REUSEPORT the extra endpoints could not bind,
-                // so the default has to be one -- and an explicit request for more is
-                // a config error rather than the panic it used to be.
+                // One socket, matching the Go agent's sing-box listener, which binds exactly
+                // one `net.UDPConn` per inbound.
+                //
+                // A SO_REUSEPORT fan-out is not a transparent optimisation for QUIC: the
+                // kernel steers each datagram by hashing its 4-tuple, so a connection is
+                // pinned to one socket only while the peer's address holds still. When a
+                // client's source port changes -- a NAT rebinding under load, or Hysteria2
+                // port hopping -- its packets hash to a *different* endpoint, which holds no
+                // such connection and cannot migrate it. On one socket the same change is
+                // just a path migration the connection survives.
+                //
+                // Operators who want the fan-out can still ask for it explicitly.
                 if *num_endpoints == 0 {
-                    *num_endpoints = if supports_reuse_port() {
-                        get_num_threads()
-                    } else {
-                        1
-                    };
+                    *num_endpoints = 1;
                 } else if *num_endpoints > 1 && !supports_reuse_port() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         "num_endpoints above 1 needs SO_REUSEPORT, which this platform \
                          does not have",
                     ));
+                } else if *num_endpoints > 1 {
+                    // Proven on Linux: a rebinding client is lost roughly seven
+                    // times in eight, because the kernel steers by a hash of the
+                    // 4-tuple and a migration is exactly a change of 4-tuple.
+                    // Correct multi-socket QUIC needs a connection-ID dispatcher,
+                    // which this does not have, so say so rather than let an
+                    // operator discover it as intermittent disconnects.
+                    log::warn!(
+                        "quic_settings.num_endpoints is {num_endpoints}: a SO_REUSEPORT \
+                         fan-out cannot migrate a connection whose peer changes address, \
+                         so clients behind a rebinding NAT will drop. Use 1 unless you \
+                         know your clients never migrate."
+                    );
                 }
             }
             None => {

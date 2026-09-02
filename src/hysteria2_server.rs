@@ -31,11 +31,31 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 /// Maximum number of authenticated TCP logical flows one physical Hysteria2
 /// connection may process concurrently.
 ///
-/// Quinn enforces the same advertised stream ceiling, while the semaphore below
-/// remains the application-owned backstop and covers work after the peer has
-/// finished uploading its stream bytes but DNS, outbound setup, or copying is still
-/// alive.
-const MAX_ACTIVE_TCP_LOGICAL_FLOWS: usize = 256;
+/// One flow is one proxied TCP connection, held for that connection's whole life --
+/// keep-alive idle time included -- so a browsing session accumulates them and a
+/// speed test's parallel connections land on top. 256 is reachable in ordinary use,
+/// and reaching it was not a graceful degradation; see
+/// [`ADVERTISED_BIDI_STREAM_HEADROOM`].
+///
+/// sing-quic advertises `MaxIncomingStreams: 1 << 60`, i.e. no ceiling at all. A
+/// bound is still worth keeping -- each flow owns an outbound socket, a task and two
+/// 32 KiB copy buffers, so this is ~64 MiB and 1024 descriptors per connection -- but
+/// it belongs well clear of what a real client reaches.
+const MAX_ACTIVE_TCP_LOGICAL_FLOWS: usize = 1024;
+
+/// How far above [`MAX_ACTIVE_TCP_LOGICAL_FLOWS`] the advertised QUIC stream ceiling
+/// sits.
+///
+/// These were equal, which meant the application backstop could never fire: quinn
+/// withheld `MAX_STREAMS` credit instead, and a peer at the ceiling saw `open_bi`
+/// block with no error and no timeout. For a proxy that reads as the whole node
+/// having frozen -- established flows keep working while every new connection hangs
+/// -- and it is indistinguishable from a dead server until the load drops.
+///
+/// Headroom makes the semaphore the binding limit, so an excess stream is accepted
+/// and promptly reset with [`TCP_FLOW_LIMIT_ERROR_CODE`]: a failed connection the
+/// client can report or retry, rather than an indefinite stall.
+const ADVERTISED_BIDI_STREAM_HEADROOM: u32 = 64;
 
 /// Absolute time allowed to deliver one Hysteria2 TCP request header after its QUIC
 /// stream is accepted. Progress does not reset this deadline.
@@ -632,16 +652,32 @@ async fn auth_connection(
                             .and_then(|value| value.to_str().ok())
                             .and_then(|value| value.parse::<u64>().ok())
                             .unwrap_or(0);
-                        let bandwidth = crate::hysteria2::brutal::negotiate_server(
+                        let negotiation = crate::hysteria2::brutal::negotiate_server(
                             client_receive_bps,
                             settings.up_mbps,
                             settings.down_mbps,
                             settings.ignore_client_bandwidth,
                         );
-                        if let Some(send_bps) = bandwidth.send_bps {
+                        let (send_bps, advertised_receive) = match negotiation {
+                            // sing-quic answers an unacceptable bandwidth declaration with the
+                            // masquerade rather than an error, so a prober cannot tell that the
+                            // credential was in fact valid.
+                            crate::hysteria2::brutal::ServerNegotiation::ServeMasquerade => {
+                                debug!(
+                                    "Serving Hysteria2 masquerade response: the client declared no receive rate while one is configured"
+                                );
+                                settings.masquerade.respond(req, stream).await?;
+                                continue;
+                            }
+                            crate::hysteria2::brutal::ServerNegotiation::Accept {
+                                send_bps,
+                                advertised_receive,
+                            } => (send_bps, advertised_receive),
+                        };
+                        if let Some(send_bps) = send_bps {
                             crate::hysteria2::brutal::activate(connection, send_bps)?;
                         }
-                        let advertised_receive = bandwidth.advertised_receive.header_value();
+                        let advertised_receive = advertised_receive.header_value();
 
                         let resp = http::Response::builder()
                             .status(http::status::StatusCode::from_u16(233).unwrap())
@@ -1977,7 +2013,16 @@ async fn process_tcp_stream(
 
     let (_, _) = futures::join!(server_stream.shutdown(), client_stream.shutdown());
 
-    copy_result?;
+    // Name the destination on the way out. A copy that ends in an error is the one
+    // failure in this path that otherwise reaches the log as a bare transport
+    // message -- "connection lost" with nothing to tie it to a request -- which is
+    // exactly the case an operator needs to identify from a log alone.
+    copy_result.map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("proxying to {remote_location} failed: {error}"),
+        )
+    })?;
     Ok(())
 }
 
@@ -2063,21 +2108,28 @@ pub async fn start_hysteria2_server(
         // values estimated from https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/server/config.go#L16
         Arc::get_mut(&mut server_config.transport)
             .unwrap()
-            .max_concurrent_bidi_streams((MAX_ACTIVE_TCP_LOGICAL_FLOWS as u32).into())
+            .max_concurrent_bidi_streams(
+                (MAX_ACTIVE_TCP_LOGICAL_FLOWS as u32 + ADVERTISED_BIDI_STREAM_HEADROOM)
+                    .into(),
+            )
             // required for HTTP/3 QPACK updates
             .max_concurrent_uni_streams(1024_u32.into())
             .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()))
             .keep_alive_interval(Some(Duration::from_secs(10)))
             .send_window(16 * 1024 * 1024)
             .receive_window((20u32 * 1024 * 1024).into())
-            // Quinn closes the connection when receive-buffer compaction still
-            // leaves more than 1024 chunks in one stream. A larger per-stream
-            // flow-control window lets a sustained upload retain more chunks
-            // behind missing data, increasing the chance of hitting that limit.
-            // Use Quinn's 1_250_000-byte default here as an empirical mitigation,
-            // not a proven safety bound. The 20 MiB connection window remains
-            // available to parallel streams.
-            .stream_receive_window(1_250_000u32.into())
+            // sing-box's value (`hysteria.DefaultStreamReceiveWindow`), with the 20 MiB
+            // connection window above it in the same 5:2 ratio.
+            //
+            // A caveat that does not exist on quic-go: quinn rejects a stream whose
+            // buffer it cannot compact below 1024 spans (`MAX_CHUNKS`) and reports that
+            // as a connection-level INTERNAL_ERROR, where quic-go's equivalent ceiling
+            // is 20_000 gaps (`MaxStreamFrameSorterGaps`). At this window that needs
+            // roughly 18% loss scattered across a full window to reach, so it is a
+            // known residual risk rather than a reason to run a smaller window than the
+            // reference: a smaller one costs every long-RTT stream its throughput, which
+            // is a certain loss traded against an unlikely one.
+            .stream_receive_window((8u32 * 1024 * 1024).into())
             // MTU settings per official TUIC reference
             .initial_mtu(1200)
             .min_mtu(1200)
