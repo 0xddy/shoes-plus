@@ -258,6 +258,9 @@ protocol:
   type: hysteria2
   password: string
   udp_enabled: true            # Default: true
+  up_mbps: 0                   # Maximum server-to-client Brutal rate; 0 = uncapped
+  down_mbps: 0                 # Advertised client-to-server rate; 0 = uncapped
+  ignore_client_bandwidth: false # true asks both sides to retain BBR
 ```
 
 ### TUIC v5

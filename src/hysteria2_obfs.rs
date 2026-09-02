@@ -114,6 +114,53 @@ impl Salamander {
         }
         len - SALT_LEN
     }
+
+    /// Deobfuscates every datagram in a buffer returned through UDP GRO and
+    /// compacts the plaintext datagrams in place.
+    ///
+    /// `RecvMeta::stride` describes the *wire* datagram size. Removing one
+    /// salt from every datagram therefore changes both the total length and
+    /// the stride. Treating the whole buffer as a single Salamander packet
+    /// would use only the first salt and corrupt every later QUIC datagram.
+    fn deobfuscate_recv_buffer(
+        &self,
+        buffer: &mut [u8],
+        wire_len: usize,
+        wire_stride: usize,
+    ) -> (usize, usize) {
+        let wire_len = wire_len.min(buffer.len());
+        if wire_len == 0 {
+            return (0, 0);
+        }
+
+        // A zero or oversized stride is not a valid GRO description. Handle
+        // it as one datagram so the metadata passed to quinn always makes
+        // forward progress instead of producing a zero-length split loop.
+        let wire_stride = if wire_stride == 0 || wire_stride >= wire_len {
+            wire_len
+        } else {
+            wire_stride
+        };
+        let mut read_offset = 0;
+        let mut write_offset = 0;
+        let mut plaintext_stride = None;
+
+        while read_offset < wire_len {
+            let segment_end = read_offset.saturating_add(wire_stride).min(wire_len);
+            let plaintext_len = self.deobfuscate(&mut buffer[read_offset..segment_end]);
+
+            // Removing each salt leaves gaps between GRO segments. Compact
+            // them so the updated stride still describes adjacent datagrams.
+            if write_offset != read_offset && plaintext_len != 0 {
+                buffer.copy_within(read_offset..read_offset + plaintext_len, write_offset);
+            }
+            plaintext_stride.get_or_insert(plaintext_len);
+            write_offset += plaintext_len;
+            read_offset = segment_end;
+        }
+
+        (write_offset, plaintext_stride.unwrap_or(0))
+    }
 }
 
 #[cfg(test)]
@@ -275,6 +322,185 @@ mod tests {
         assert!(!rendered.contains("hunter2"), "{rendered}");
         assert!(rendered.contains("password_len"));
     }
+
+    #[test]
+    fn gro_datagrams_are_deobfuscated_independently_and_compacted() {
+        let salamander = Salamander::new("gro-upload");
+        let payloads = [
+            (0..1192).map(|i| (i % 251) as u8).collect::<Vec<_>>(),
+            (0..1192)
+                .map(|i| (250 - (i % 251)) as u8)
+                .collect::<Vec<_>>(),
+            (0..713).map(|i| ((i * 7) % 251) as u8).collect::<Vec<_>>(),
+        ];
+        let salts = [[1; SALT_LEN], [2; SALT_LEN], [3; SALT_LEN]];
+        let mut gro_buffer = Vec::new();
+        let mut wire = Vec::new();
+        for (payload, salt) in payloads.iter().zip(salts.iter()) {
+            salamander.obfuscate_with_salt(salt, payload, &mut wire);
+            gro_buffer.extend_from_slice(&wire);
+        }
+
+        let wire_len = gro_buffer.len();
+        let wire_stride = payloads[0].len() + SALT_LEN;
+        let (plaintext_len, plaintext_stride) =
+            salamander.deobfuscate_recv_buffer(&mut gro_buffer, wire_len, wire_stride);
+
+        assert_eq!(plaintext_stride, payloads[0].len());
+        assert_eq!(plaintext_len, payloads.iter().map(Vec::len).sum::<usize>());
+        let mut offset = 0;
+        for payload in &payloads {
+            assert_eq!(&gro_buffer[offset..offset + payload.len()], payload);
+            offset += payload.len();
+        }
+    }
+
+    #[derive(Debug)]
+    struct GroCapacitySocket;
+
+    impl quinn::AsyncUdpSocket for GroCapacitySocket {
+        fn create_io_poller(
+            self: std::sync::Arc<Self>,
+        ) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
+            unreachable!("the capacity test never polls the socket")
+        }
+
+        fn try_send(&self, _transmit: &quinn::udp::Transmit<'_>) -> std::io::Result<()> {
+            unreachable!("the capacity test never sends")
+        }
+
+        fn poll_recv(
+            &self,
+            _cx: &mut std::task::Context<'_>,
+            _bufs: &mut [std::io::IoSliceMut<'_>],
+            _meta: &mut [quinn::udp::RecvMeta],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+
+        fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+            Ok(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        }
+
+        fn max_receive_segments(&self) -> usize {
+            64
+        }
+    }
+
+    #[test]
+    fn socket_accounts_for_inner_gro_capacity_and_salts() {
+        let socket = ObfuscatedUdpSocket::new(
+            std::sync::Arc::new(GroCapacitySocket),
+            Salamander::new("gro-capacity"),
+        );
+
+        // One extra segment's worth of allocation covers the eight-byte salt
+        // added to each of the inner socket's 64 possible GRO segments.
+        assert_eq!(quinn::AsyncUdpSocket::max_receive_segments(&socket), 65);
+        assert_eq!(quinn::AsyncUdpSocket::max_transmit_segments(&socket), 1);
+    }
+
+    /// A socket that answers one `poll_recv` with a GRO batch, the way the Linux
+    /// kernel hands quinn several same-sized datagrams in a single buffer.
+    #[derive(Debug)]
+    struct GroBatchSocket {
+        wire: Vec<u8>,
+        stride: usize,
+    }
+
+    impl quinn::AsyncUdpSocket for GroBatchSocket {
+        fn create_io_poller(
+            self: std::sync::Arc<Self>,
+        ) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
+            unreachable!("the batch test never waits for readiness")
+        }
+
+        fn try_send(&self, _transmit: &quinn::udp::Transmit<'_>) -> std::io::Result<()> {
+            unreachable!("the batch test never sends")
+        }
+
+        fn poll_recv(
+            &self,
+            _cx: &mut std::task::Context<'_>,
+            bufs: &mut [std::io::IoSliceMut<'_>],
+            meta: &mut [quinn::udp::RecvMeta],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            bufs[0][..self.wire.len()].copy_from_slice(&self.wire);
+            meta[0] = quinn::udp::RecvMeta {
+                addr: std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+                len: self.wire.len(),
+                stride: self.stride,
+                ..Default::default()
+            };
+            std::task::Poll::Ready(Ok(1))
+        }
+
+        fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+            Ok(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        }
+
+        fn max_receive_segments(&self) -> usize {
+            64
+        }
+    }
+
+    /// The decorator is what quinn actually reads through, so the segment-by-segment
+    /// decode has to survive `poll_recv` and not just the helper underneath it.
+    ///
+    /// This is the case that took Hysteria2 uploads down while downloads stayed
+    /// healthy: a client streaming data fills full-size datagrams back to back, which
+    /// is exactly what UDP GRO coalesces, while the ACKs coming back the other way
+    /// arrive alone and decode fine. Deobfuscating the coalesced buffer as one packet
+    /// recovered only its first datagram and handed quinn one oversized, corrupt one.
+    #[test]
+    fn poll_recv_splits_a_gro_batch_back_into_datagrams() {
+        let salamander = Salamander::new("gro-poll-recv");
+        // Three full segments and a short tail, as a real batch ends.
+        let payloads = [
+            vec![0xa1u8; 1200],
+            vec![0xb2u8; 1200],
+            vec![0xc3u8; 1200],
+            vec![0xd4u8; 517],
+        ];
+        let mut wire = Vec::new();
+        let mut segment = Vec::new();
+        for payload in &payloads {
+            salamander.obfuscate(payload, &mut segment);
+            wire.extend_from_slice(&segment);
+        }
+        let stride = payloads[0].len() + SALT_LEN;
+
+        let socket = ObfuscatedUdpSocket::new(
+            std::sync::Arc::new(GroBatchSocket {
+                wire: wire.clone(),
+                stride,
+            }),
+            salamander,
+        );
+
+        let mut buffer = vec![0u8; wire.len() + 64];
+        let mut bufs = [std::io::IoSliceMut::new(&mut buffer)];
+        let mut meta = [quinn::udp::RecvMeta::default()];
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let count = match quinn::AsyncUdpSocket::poll_recv(&socket, &mut cx, &mut bufs, &mut meta) {
+            Poll::Ready(Ok(count)) => count,
+            other => panic!("the batch should be delivered at once: {other:?}"),
+        };
+
+        assert_eq!(count, 1);
+        assert_eq!(meta[0].stride, payloads[0].len());
+        assert_eq!(meta[0].len, payloads.iter().map(Vec::len).sum::<usize>());
+        let mut offset = 0;
+        for (index, payload) in payloads.iter().enumerate() {
+            assert_eq!(
+                &bufs[0][offset..offset + payload.len()],
+                payload.as_slice(),
+                "datagram {index} did not survive the batch"
+            );
+            offset += payload.len();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -308,18 +534,15 @@ thread_local! {
 /// all the platform-specific work -- ECN, source addresses, readiness -- stays
 /// with quinn's own socket, and this type only transforms bytes on the way past.
 ///
-/// # GSO and GRO are disabled
+/// # GSO is disabled; GRO is decoded segment by segment
 ///
-/// Both offloads work by moving several datagrams through the kernel as one
-/// buffer, but Salamander gives every datagram its own random salt and its own
-/// length. A coalesced buffer therefore cannot be obfuscated or recovered as a
-/// unit, so [`max_transmit_segments`] and [`max_receive_segments`] both report
-/// `1` and the kernel hands us one datagram at a time. That costs throughput on
-/// high-bandwidth links; it is the price of the obfuscation, and it applies only
-/// to inbounds that switch it on.
+/// Both offloads move several datagrams through the kernel as one buffer, while
+/// Salamander gives every datagram its own random salt. Outgoing GSO is disabled
+/// because each segment must be obfuscated separately. Linux UDP GRO may already
+/// be enabled on the wrapped quinn socket, however, so receive capacity is
+/// preserved and every GRO segment is decoded and compacted independently.
 ///
 /// [`max_transmit_segments`]: AsyncUdpSocket::max_transmit_segments
-/// [`max_receive_segments`]: AsyncUdpSocket::max_receive_segments
 #[derive(Debug)]
 pub struct ObfuscatedUdpSocket {
     inner: Arc<dyn AsyncUdpSocket>,
@@ -377,12 +600,9 @@ impl AsyncUdpSocket for ObfuscatedUdpSocket {
         let count = std::task::ready!(self.inner.poll_recv(cx, bufs, meta))?;
 
         for (buffer, meta) in bufs.iter_mut().zip(meta.iter_mut()).take(count) {
-            let len = meta.len.min(buffer.len());
-            meta.len = self.salamander.deobfuscate(&mut buffer[..len]);
-            // GRO is off, so one buffer is one datagram and the stride is simply
-            // its new length. Leaving the pre-decode stride here would tell
-            // quinn the buffer holds several datagrams that are no longer there.
-            meta.stride = meta.len;
+            (meta.len, meta.stride) =
+                self.salamander
+                    .deobfuscate_recv_buffer(buffer, meta.len, meta.stride);
         }
         Poll::Ready(Ok(count))
     }
@@ -396,7 +616,13 @@ impl AsyncUdpSocket for ObfuscatedUdpSocket {
     }
 
     fn max_receive_segments(&self) -> usize {
-        1
+        // The wrapped Tokio socket enables UDP GRO on Linux before this
+        // decorator is installed. Propagating its capacity is required for
+        // quinn to allocate buffers large enough for the coalesced datagrams.
+        // The extra segment's allocation also covers Salamander's eight-byte
+        // overhead on every wire segment (Quinn's configured payload is at
+        // least 1200 bytes and quinn-udp currently caps GRO at 64 segments).
+        self.inner.max_receive_segments().saturating_add(1)
     }
 
     fn may_fragment(&self) -> bool {

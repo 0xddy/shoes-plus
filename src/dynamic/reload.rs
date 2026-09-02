@@ -234,6 +234,7 @@ enum QuicNativeSettings {
         /// selector slot cannot reach either after the listener has started.
         up_mbps: u64,
         down_mbps: u64,
+        ignore_client_bandwidth: bool,
         /// Compared in full, password included, unlike the credential above.
         ///
         /// A registry can take over *authentication*, but nothing can take over
@@ -284,6 +285,7 @@ impl QuicNativeSettings {
                 udp_enabled,
                 up_mbps,
                 down_mbps,
+                ignore_client_bandwidth,
                 obfs,
                 masquerade,
             } => Some(Self::Hysteria2 {
@@ -291,6 +293,7 @@ impl QuicNativeSettings {
                 udp_enabled: *udp_enabled,
                 up_mbps: *up_mbps,
                 down_mbps: *down_mbps,
+                ignore_client_bandwidth: *ignore_client_bandwidth,
                 obfs: obfs.clone(),
                 masquerade: masquerade.clone(),
             }),
@@ -316,6 +319,7 @@ impl QuicNativeSettings {
                     udp_enabled,
                     up_mbps,
                     down_mbps,
+                    ignore_client_bandwidth,
                     obfs,
                     masquerade,
                 },
@@ -324,6 +328,7 @@ impl QuicNativeSettings {
                     udp_enabled: new_udp,
                     up_mbps: new_up_mbps,
                     down_mbps: new_down_mbps,
+                    ignore_client_bandwidth: new_ignore_client_bandwidth,
                     obfs: new_obfs,
                     masquerade: new_masquerade,
                 },
@@ -336,6 +341,8 @@ impl QuicNativeSettings {
                     Some("up_mbps")
                 } else if down_mbps != new_down_mbps {
                     Some("down_mbps")
+                } else if ignore_client_bandwidth != new_ignore_client_bandwidth {
+                    Some("ignore_client_bandwidth")
                 } else if obfs != new_obfs {
                     Some("obfs")
                 } else if masquerade != new_masquerade {
@@ -1553,6 +1560,27 @@ mod tests {
             err.to_string().contains("rules"),
             "say what *can* change: {err}"
         );
+        assert_eq!(slot.generation(), 0, "a rejected reload swaps nothing");
+    }
+
+    #[test]
+    fn a_rule_slot_refuses_a_changed_client_bandwidth_policy() {
+        let (handle, slot) = hysteria2_handle(false, true);
+        let mut changed = hysteria2_config(false);
+        if let ServerProxyConfig::Hysteria2 {
+            ignore_client_bandwidth,
+            ..
+        } = &mut changed.protocol
+        {
+            *ignore_client_bandwidth = true;
+        }
+
+        let err = handle
+            .reload(changed, &resolver(), None)
+            .expect_err("ignore_client_bandwidth cannot change in place");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("ignore_client_bandwidth"), "{err}");
         assert_eq!(slot.generation(), 0, "a rejected reload swaps nothing");
     }
 

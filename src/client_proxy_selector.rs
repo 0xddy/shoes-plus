@@ -267,16 +267,13 @@ impl ClientProxySelector {
     /// `None` retains legacy demand-driven sniffing, `Some(true)` enables it for
     /// every TCP stream, and `Some(false)` disables it unconditionally.
     pub fn with_sniff_policy(rules: Vec<ConnectRule>, sniff_policy: Option<bool>) -> Self {
-        // Rich predicates that contain destination IP ranges must be able to evaluate a
-        // hostname. Legacy masks retain the historical no-resolution default.
-        let resolve_rule_hostnames = rules.iter().any(|rule| {
-            rule.predicate
-                .as_ref()
-                .is_some_and(RoutePredicate::requires_ip)
-        });
+        // Match sing-box route semantics: destination-IP predicates only inspect an
+        // address that is already literal or pre-resolved. DNS resolution for routing
+        // remains available as an explicit compatibility opt-in through
+        // `with_options(rules, true)`.
         Self::with_options_and_cache_size_and_sniff_policy(
             rules,
-            resolve_rule_hostnames,
+            false,
             RoutingCache::DEFAULT_CAPACITY,
             sniff_policy,
         )
@@ -1758,10 +1755,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_mixed_ip_and_hostname_rules() {
-        // Note: With resolve_rule_hostnames=false (default), hostname destinations
-        // encountering IP rules will attempt to resolve the hostname. To avoid this,
-        // place hostname rules before IP rules, or use resolve_rule_hostnames=true
-        // with proper DNS mock mappings.
+        // With resolve_rule_hostnames=false (default), hostname destinations do not
+        // trigger DNS merely to evaluate an IP rule. Hostname rules can still match
+        // directly, so keep the more specific rules before the fallback.
         let rules = vec![
             block_rule(vec!["malware.com"]),
             allow_rule(vec!["trusted.com"], "trusted"), // Hostname rules before IP rules
@@ -2547,7 +2543,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ip_predicate_uses_existing_lazy_hostname_resolution_policy() {
+    async fn ip_predicate_does_not_resolve_hostname_by_default() {
+        let private_block = ConnectRule::try_with_match_config(
+            vec![NetLocationMask::ANY],
+            RouteMatchConfig {
+                ip_cidr: vec!["10.0.0.0/8".into()],
+                ..Default::default()
+            },
+            ConnectAction::new_block(),
+        )
+        .unwrap();
+        let selector = ClientProxySelector::with_sniff_policy(
+            vec![private_block, allow_rule(vec!["0.0.0.0/0"], "default")],
+            None,
+        );
+        let counting_resolver = Arc::new(RebindingResolver::new(
+            IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+            IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+        ));
+        let resolver: Arc<dyn Resolver> = counting_resolver.clone();
+        let destination = NetLocation::new(Address::Hostname("private.example".into()), 443);
+
+        assert!(matches!(
+            selector
+                .judge_tcp(destination.into(), &resolver)
+                .await
+                .unwrap(),
+            ConnectDecision::Allow { .. }
+        ));
+        assert_eq!(
+            counting_resolver.calls(),
+            0,
+            "default route matching must not resolve an FQDN for an IP predicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn ip_predicate_resolves_hostname_when_explicitly_enabled() {
+        let private_block = ConnectRule::try_with_match_config(
+            vec![NetLocationMask::ANY],
+            RouteMatchConfig {
+                ip_cidr: vec!["10.0.0.0/8".into()],
+                ..Default::default()
+            },
+            ConnectAction::new_block(),
+        )
+        .unwrap();
+        let selector = ClientProxySelector::with_options(
+            vec![private_block, allow_rule(vec!["0.0.0.0/0"], "default")],
+            true,
+        );
+        let counting_resolver = Arc::new(RebindingResolver::new(
+            IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+            IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+        ));
+        let resolver: Arc<dyn Resolver> = counting_resolver.clone();
+        let destination = NetLocation::new(Address::Hostname("private.example".into()), 443);
+
+        assert!(matches!(
+            selector
+                .judge_tcp(destination.into(), &resolver)
+                .await
+                .unwrap(),
+            ConnectDecision::Block
+        ));
+        assert_eq!(counting_resolver.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn ip_predicate_uses_pre_resolved_hostname_without_resolver() {
         let private_block = ConnectRule::try_with_match_config(
             vec![NetLocationMask::ANY],
             RouteMatchConfig {
@@ -2561,12 +2625,44 @@ mod tests {
             private_block,
             allow_rule(vec!["0.0.0.0/0"], "default"),
         ]);
-        let resolver: Arc<dyn Resolver> = Arc::new(MockResolver::new().with_mapping(
-            "private.example",
-            443,
-            vec![IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))],
+        let counting_resolver = Arc::new(RebindingResolver::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
         ));
-        let destination = NetLocation::new(Address::Hostname("private.example".into()), 443);
+        let resolver: Arc<dyn Resolver> = counting_resolver.clone();
+        let destination = ResolvedLocation::with_resolved(
+            NetLocation::new(Address::Hostname("private.example".into()), 443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), 443),
+        );
+
+        assert!(matches!(
+            selector.judge_tcp(destination, &resolver).await.unwrap(),
+            ConnectDecision::Block
+        ));
+        assert_eq!(counting_resolver.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn ip_predicate_matches_literal_ip_without_resolver() {
+        let private_block = ConnectRule::try_with_match_config(
+            vec![NetLocationMask::ANY],
+            RouteMatchConfig {
+                ip_cidr: vec!["10.0.0.0/8".into()],
+                ..Default::default()
+            },
+            ConnectAction::new_block(),
+        )
+        .unwrap();
+        let selector = ClientProxySelector::new(vec![
+            private_block,
+            allow_rule(vec!["0.0.0.0/0"], "default"),
+        ]);
+        let counting_resolver = Arc::new(RebindingResolver::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+        ));
+        let resolver: Arc<dyn Resolver> = counting_resolver.clone();
+        let destination = NetLocation::new(Address::Ipv4(Ipv4Addr::new(10, 1, 2, 3)), 443);
 
         assert!(matches!(
             selector
@@ -2575,6 +2671,7 @@ mod tests {
                 .unwrap(),
             ConnectDecision::Block
         ));
+        assert_eq!(counting_resolver.calls(), 0);
     }
 
     #[tokio::test]
@@ -2588,7 +2685,7 @@ mod tests {
             ConnectAction::new_allow(None, mock_chain_group()),
         )
         .unwrap();
-        let selector = ClientProxySelector::new(vec![routed]);
+        let selector = ClientProxySelector::with_options(vec![routed], true);
         let expected = vec![
             IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
@@ -2656,10 +2753,10 @@ mod tests {
             ConnectAction::new_block(),
         )
         .unwrap();
-        let selector = ClientProxySelector::new(vec![
-            private_block,
-            allow_rule(vec!["0.0.0.0/0"], "default"),
-        ]);
+        let selector = ClientProxySelector::with_options(
+            vec![private_block, allow_rule(vec!["0.0.0.0/0"], "default")],
+            true,
+        );
         let rebinding = Arc::new(RebindingResolver::new(
             IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
             IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),

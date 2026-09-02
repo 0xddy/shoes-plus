@@ -325,6 +325,7 @@ struct Hysteria2ConnectionSettings {
     udp_enabled: bool,
     up_mbps: u64,
     down_mbps: u64,
+    ignore_client_bandwidth: bool,
     masquerade: Arc<crate::hysteria2_masquerade::Hysteria2Masquerade>,
 }
 
@@ -619,6 +620,7 @@ async fn auth_connection(
                             client_receive_bps,
                             settings.up_mbps,
                             settings.down_mbps,
+                            settings.ignore_client_bandwidth,
                         );
                         if let Some(send_bps) = bandwidth.send_bps {
                             crate::hysteria2::brutal::activate(connection, send_bps)?;
@@ -1733,6 +1735,13 @@ async fn run_tcp_loop(
 /// See: https://github.com/apernet/hysteria/blob/master/core/internal/protocol/proxy.go#L15
 const FRAME_TYPE_TCP_REQUEST: u64 = 0x401;
 
+/// Maximum error message length carried by a Hysteria2 TCP response.
+///
+/// This is the protocol limit used by the reference implementation. Keep the
+/// bound here even though all of our current errors are much shorter: resolver
+/// and proxy-chain errors can include attacker-controlled destination text.
+const MAX_TCP_RESPONSE_MESSAGE_LENGTH: usize = 2048;
+
 async fn handle_tcp_header(
     stream: &mut Box<dyn AsyncStream>,
 ) -> std::io::Result<(NetLocation, StreamReader)> {
@@ -1768,39 +1777,74 @@ async fn handle_tcp_header(
         .read_slice(stream, padding_len as usize)
         .await?;
 
-    let response_bytes = {
-        // [uint8] Status (0x00 = OK, 0x01 = Error)
-        // [varint] Message length
-        // [bytes] Message string
-        // [varint] Padding length
-        // [bytes] Random padding
-
-        let mut rng = rand::rng();
-
-        // only use the lower 6 bits so that the varint always fits in a single u8
-        let padding_len = rng.random_range(0..=63);
-
-        // first 3 bytes of status = 0x0, message length = 0, padding length
-        let mut response_bytes = allocate_vec(3 + (padding_len as usize));
-        response_bytes[0] = 0;
-        response_bytes[1] = 0;
-        response_bytes[2] = padding_len;
-        rng.fill_bytes(&mut response_bytes[3..]);
-
-        response_bytes
-    };
-
-    let len = response_bytes.len();
-    let mut i = 0;
-    while i < len {
-        let count = stream
-            .write(&response_bytes[i..len])
-            .await
-            .map_err(|e| std::io::Error::other(format!("H3 stream write failed: {e}")))?;
-        i += count;
-    }
-
     Ok((remote_location, stream_reader))
+}
+
+fn encode_tcp_response(ok: bool, message: &str) -> std::io::Result<Vec<u8>> {
+    // Keep truncation on a UTF-8 boundary. The wire field is bytes, but preserving
+    // valid UTF-8 makes the diagnostic useful to clients that display it directly.
+    let mut message_len = message.len().min(MAX_TCP_RESPONSE_MESSAGE_LENGTH);
+    while !message.is_char_boundary(message_len) {
+        message_len -= 1;
+    }
+    let message = &message.as_bytes()[..message_len];
+    let message_len = encode_varint(message.len() as u64)?;
+
+    // Keeping this at most 63 makes the padding length itself a one-byte varint,
+    // matching the response shape previously emitted here and sing-quic's bounded
+    // random padding.
+    let mut rng = rand::rng();
+    let padding_len = rng.random_range(0usize..=63);
+    let encoded_padding_len = encode_varint(padding_len as u64)?;
+
+    let mut response = Vec::with_capacity(
+        1 + message_len.len() + message.len() + encoded_padding_len.len() + padding_len,
+    );
+    response.push(if ok { 0 } else { 1 });
+    response.extend_from_slice(&message_len);
+    response.extend_from_slice(message);
+    response.extend_from_slice(&encoded_padding_len);
+    let padding_start = response.len();
+    response.resize(padding_start + padding_len, 0);
+    rng.fill_bytes(&mut response[padding_start..]);
+    Ok(response)
+}
+
+async fn write_tcp_response<W>(stream: &mut W, ok: bool, message: &str) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin + ?Sized,
+{
+    let response = encode_tcp_response(ok, message)?;
+    stream.write_all(&response).await.map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("Hysteria2 TCP response write failed: {error}"),
+        )
+    })
+}
+
+async fn write_tcp_fast_open_replay<W>(stream: &mut W, replay: &[u8]) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin + ?Sized,
+{
+    stream.write_all(replay).await.map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("Hysteria2 TCP fast-open replay write failed: {error}"),
+        )
+    })
+}
+
+/// Best-effort protocol rejection followed by a FIN on this logical stream.
+///
+/// The original routing/setup error remains the task result. Failing to report it
+/// to a peer that has already gone away must not be allowed to affect the other
+/// streams multiplexed over the same QUIC connection.
+async fn reject_tcp_stream(stream: &mut Box<dyn AsyncStream>, error: &std::io::Error) {
+    if let Err(response_error) = write_tcp_response(stream, false, &error.to_string()).await {
+        debug!("failed to report Hysteria2 TCP request failure: {response_error}");
+    }
+    let _ = stream.shutdown().await;
 }
 
 async fn process_tcp_stream(
@@ -1840,7 +1884,13 @@ async fn process_tcp_stream(
         .unwrap_or_default();
     drop(stream_reader);
     let sniffed = if client_proxy_selector.needs_tcp_sniff() {
-        sniff_tcp(&mut server_stream, &mut replay).await?
+        match sniff_tcp(&mut server_stream, &mut replay).await {
+            Ok(sniffed) => sniffed,
+            Err(error) => {
+                reject_tcp_stream(&mut server_stream, &error).await;
+                return Err(error);
+            }
+        }
     } else {
         None
     };
@@ -1858,33 +1908,34 @@ async fn process_tcp_stream(
     let client_setup = match setup_client_stream_future.await {
         Ok(Ok(Some(s))) => s,
         Ok(Ok(None)) => {
-            // Must have been blocked.
-            let _ = server_stream.shutdown().await;
+            let error = std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("TCP destination {remote_location} blocked by routing rules"),
+            );
+            reject_tcp_stream(&mut server_stream, &error).await;
             return Ok(());
         }
         Ok(Err(e)) => {
-            let _ = server_stream.shutdown().await;
-            return Err(client_stream_setup_error(&remote_location, e));
+            let error = client_stream_setup_error(&remote_location, e);
+            reject_tcp_stream(&mut server_stream, &error).await;
+            return Err(error);
         }
         Err(elapsed) => {
-            let _ = server_stream.shutdown().await;
-            return Err(client_stream_setup_timeout(&remote_location, elapsed));
+            let error = client_stream_setup_timeout(&remote_location, elapsed);
+            reject_tcp_stream(&mut server_stream, &error).await;
+            return Err(error);
         }
     };
+
+    // Match sing-box: a successful TCP response reports that routing, DNS and the
+    // outbound dial have all completed, not merely that the request parsed.
+    write_tcp_response(&mut server_stream, true, "").await?;
     let mut client_stream = apply_client_early_data(&mut server_stream, client_setup).await?;
 
     let client_requires_flush = if replay.is_empty() {
         false
     } else {
-        let len = replay.len();
-        let mut i = 0;
-        while i < len {
-            let count = client_stream
-                .write(&replay[i..len])
-                .await
-                .map_err(|e| std::io::Error::other(format!("H3 stream write failed: {e}")))?;
-            i += count;
-        }
+        write_tcp_fast_open_replay(&mut client_stream, &replay).await?;
         true
     };
 
@@ -1972,6 +2023,7 @@ pub async fn start_hysteria2_server(
     udp_enabled: bool,
     up_mbps: u64,
     down_mbps: u64,
+    ignore_client_bandwidth: bool,
     // Salamander obfuscation, or `None` for plain QUIC.
     obfs: Option<crate::hysteria2_obfs::Salamander>,
     masquerade: Arc<crate::hysteria2_masquerade::Hysteria2Masquerade>,
@@ -2059,6 +2111,7 @@ pub async fn start_hysteria2_server(
         udp_enabled,
         up_mbps,
         down_mbps,
+        ignore_client_bandwidth,
         masquerade,
     };
     let mut join_handles = Vec::with_capacity(endpoints.len());
@@ -2130,15 +2183,16 @@ pub async fn start_hysteria2_server(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_ACTIVE_TCP_LOGICAL_FLOWS, MAX_FRAGMENT_CACHE_SIZE,
+        MAX_ACTIVE_TCP_LOGICAL_FLOWS, MAX_FRAGMENT_CACHE_SIZE, MAX_TCP_RESPONSE_MESSAGE_LENGTH,
         MAX_UDP_FRAGMENT_BYTES_PER_CONNECTION, MAX_UDP_PACKET_SIZE, MAX_UDP_TARGETS_PER_SESSION,
         TCP_REQUEST_HEADER_TIMEOUT, UdpForwardCommand, UdpFragmentCache, UdpResponseSendOutcome,
         UdpSession, UdpTargetEvent, UdpTargetPermit, UdpTargetWorker, acquire_udp_target_permits,
         checked_response_fragment_count, checked_udp_packet_len, cleanup_udp_sessions,
         connect_udp_target, decode_udp_address_length, dispatch_udp_target_command,
-        read_tcp_request_header_before_deadline, run_connected_udp_target_worker,
-        send_udp_response_with, try_admit_tcp_logical_flow, try_reserve_payload_bytes,
-        try_reserve_udp_target_worker, udp_response_send_allowed, valid_udp_fragment,
+        encode_tcp_response, read_tcp_request_header_before_deadline,
+        run_connected_udp_target_worker, send_udp_response_with, try_admit_tcp_logical_flow,
+        try_reserve_payload_bytes, try_reserve_udp_target_worker, udp_response_send_allowed,
+        valid_udp_fragment, write_tcp_fast_open_replay, write_tcp_response,
     };
     use crate::address::{Address, NetLocation, NetLocationMask};
     use crate::async_stream::{
@@ -2146,19 +2200,27 @@ mod tests {
         AsyncWriteMessage,
     };
     use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
-    use crate::option_util::NoneOrSome;
+    use crate::config::{
+        ClientConfig, ClientProxyConfig, ClientQuicConfig, ConfigSelection, Transport,
+    };
+    use crate::dynamic::{SelectorSlot, StaticUserRegistry};
+    use crate::hysteria2_masquerade::Hysteria2Masquerade;
+    use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
     use crate::resolver::{NativeResolver, Resolver};
-    use crate::tcp::chain_builder::build_client_chain_group;
+    use crate::tcp::chain_builder::{
+        build_client_chain_group, build_client_proxy_chain, build_direct_chain_group,
+    };
     use bytes::Bytes;
     use futures::future::poll_fn;
     use rustc_hash::FxHashMap;
-    use std::net::Ipv4Addr;
+    use std::future::Future;
+    use std::net::{Ipv4Addr, SocketAddr};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use std::time::Duration;
-    use tokio::io::ReadBuf;
+    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
     use tokio::sync::Semaphore;
     use tokio::time::{Instant, advance};
     use tokio_util::sync::CancellationToken;
@@ -2962,6 +3024,216 @@ mod tests {
         assert!(!valid_udp_fragment(2, 2));
         assert!(valid_udp_fragment(0, 1));
         assert!(valid_udp_fragment(1, 2));
+    }
+
+    fn decode_test_varint(bytes: &[u8]) -> (u64, usize) {
+        let width = 1usize << (bytes[0] >> 6);
+        let mut value = u64::from(bytes[0] & 0x3f);
+        for byte in &bytes[1..width] {
+            value = (value << 8) | u64::from(*byte);
+        }
+        (value, width)
+    }
+
+    fn assert_tcp_response_shape(response: &[u8], expected_status: u8) -> &[u8] {
+        assert_eq!(response[0], expected_status);
+        let (message_len, message_width) = decode_test_varint(&response[1..]);
+        let message_start = 1 + message_width;
+        let message_end = message_start + message_len as usize;
+        let (padding_len, padding_width) = decode_test_varint(&response[message_end..]);
+        assert_eq!(
+            response.len(),
+            message_end + padding_width + padding_len as usize
+        );
+        &response[message_start..message_end]
+    }
+
+    #[test]
+    fn tcp_response_status_and_error_message_match_the_wire_contract() {
+        let success = encode_tcp_response(true, "").unwrap();
+        assert!(assert_tcp_response_shape(&success, 0).is_empty());
+
+        // 2048 is not a character boundary for this three-byte scalar. The encoder
+        // must stay within the protocol byte limit without creating invalid UTF-8.
+        let oversized = "错".repeat(MAX_TCP_RESPONSE_MESSAGE_LENGTH);
+        let failure = encode_tcp_response(false, &oversized).unwrap();
+        let message = assert_tcp_response_shape(&failure, 1);
+        assert!(message.len() <= MAX_TCP_RESPONSE_MESSAGE_LENGTH);
+        assert!(message.len() > MAX_TCP_RESPONSE_MESSAGE_LENGTH - '错'.len_utf8());
+        assert!(std::str::from_utf8(message).is_ok());
+    }
+
+    struct ZeroWriter;
+
+    impl AsyncWrite for ZeroWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            assert!(!buffer.is_empty());
+            Poll::Ready(Ok(0))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_response_and_fast_open_replay_report_write_zero() {
+        let response_error = write_tcp_response(&mut ZeroWriter, false, "DNS failed")
+            .await
+            .expect_err("a zero-length response write must not spin");
+        assert_eq!(response_error.kind(), std::io::ErrorKind::WriteZero);
+
+        let replay_error = write_tcp_fast_open_replay(&mut ZeroWriter, b"early payload")
+            .await
+            .expect_err("a zero-length replay write must not spin");
+        assert_eq!(replay_error.kind(), std::io::ErrorKind::WriteZero);
+    }
+
+    #[derive(Debug)]
+    struct RejectHostnameResolver;
+
+    impl Resolver for RejectHostnameResolver {
+        fn resolve_location(
+            &self,
+            location: &NetLocation,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>> {
+            if let Some(address) = location.to_socket_addr_nonblocking() {
+                return Box::pin(std::future::ready(Ok(vec![address])));
+            }
+            let location = location.clone();
+            Box::pin(async move {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("test DNS failure for {location}"),
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_failure_is_reported_and_the_next_hysteria_stream_still_works() {
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate test certificate");
+        let server_tls = Arc::new(crate::rustls_config_util::create_server_config(
+            certificate.cert.pem().as_bytes(),
+            certificate.signing_key.serialize_pem().as_bytes(),
+            Vec::new(),
+            &["h3".to_string()],
+            &[],
+        ));
+        let server_quic: quinn::crypto::rustls::QuicServerConfig =
+            server_tls.try_into().expect("convert test QUIC server TLS");
+
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_address = reservation.local_addr().unwrap();
+        drop(reservation);
+
+        let resolver: Arc<dyn Resolver> = Arc::new(RejectHostnameResolver);
+        let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+            vec![NetLocationMask::ANY],
+            ConnectAction::new_allow(None, build_direct_chain_group(Arc::clone(&resolver))),
+        )]));
+        let selector = SelectorSlot::new(selector, Arc::clone(&resolver));
+        let shutdown = CancellationToken::new();
+        let server_tasks = super::start_hysteria2_server(
+            server_address,
+            Arc::new(server_quic),
+            StaticUserRegistry::single_password("test-password"),
+            false,
+            selector,
+            1,
+            false,
+            0,
+            0,
+            false,
+            None,
+            Arc::new(Hysteria2Masquerade::new(None).unwrap()),
+            shutdown.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("start Hysteria2 test server");
+
+        let tcp_echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_echo_address = tcp_echo.local_addr().unwrap();
+        let tcp_echo_task = tokio::spawn(async move {
+            let (mut stream, _) = tcp_echo.accept().await.unwrap();
+            let mut data = [0_u8; 11];
+            stream.read_exact(&mut data).await.unwrap();
+            stream.write_all(&data).await.unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let chain = build_client_proxy_chain(
+            OneOrSome::One(crate::config::ClientChainHop::Single(
+                ConfigSelection::Config(ClientConfig {
+                    address: NetLocation::from_ip_addr(server_address.ip(), server_address.port()),
+                    protocol: ClientProxyConfig::Hysteria2 {
+                        password: "test-password".to_string(),
+                        udp_enabled: false,
+                        up_mbps: 0,
+                        down_mbps: 0,
+                        obfs: None,
+                        server_ports: NoneOrSome::None,
+                        hop_interval: None,
+                    },
+                    transport: Transport::Quic,
+                    quic_settings: Some(ClientQuicConfig {
+                        verify: false,
+                        sni_hostname: NoneOrOne::One("localhost".to_string()),
+                        ..ClientQuicConfig::default()
+                    }),
+                    ..ClientConfig::default()
+                }),
+            )),
+            Arc::clone(&resolver),
+        );
+
+        let failed_target = NetLocation::new(Address::Hostname("upload.invalid".into()), 8080);
+        let failed = tokio::time::timeout(
+            Duration::from_secs(3),
+            chain.connect_tcp(failed_target.into(), &resolver),
+        )
+        .await
+        .expect("the server must report DNS failure without waiting for stream EOF");
+        let error = match failed {
+            Ok(_) => panic!("DNS failure was incorrectly reported as TCP handshake success"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("test DNS failure"), "{error}");
+
+        let mut proxied = chain
+            .connect_tcp(
+                NetLocation::from_ip_addr(tcp_echo_address.ip(), tcp_echo_address.port()).into(),
+                &resolver,
+            )
+            .await
+            .expect("a DNS failure on one stream must not close the Hysteria2 connection")
+            .client_stream;
+        proxied.write_all(b"still-alive").await.unwrap();
+        proxied.flush().await.unwrap();
+        let mut reply = [0_u8; 11];
+        tokio::time::timeout(Duration::from_secs(3), proxied.read_exact(&mut reply))
+            .await
+            .expect("echo after failed stream timed out")
+            .unwrap();
+        assert_eq!(&reply, b"still-alive");
+
+        drop(proxied);
+        drop(chain);
+        shutdown.cancel();
+        tcp_echo_task.await.unwrap();
+        for task in server_tasks {
+            let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+        }
     }
 
     #[test]

@@ -985,6 +985,7 @@ pub(crate) async fn start_quic_servers_with_resolved_bind(
             udp_enabled,
             up_mbps,
             down_mbps,
+            ignore_client_bandwidth,
             obfs,
             masquerade,
         } => {
@@ -1025,6 +1026,7 @@ pub(crate) async fn start_quic_servers_with_resolved_bind(
                     udp_enabled,
                     up_mbps,
                     down_mbps,
+                    ignore_client_bandwidth,
                     obfs.clone(),
                     masquerade.clone(),
                     cancel.clone(),

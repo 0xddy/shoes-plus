@@ -103,29 +103,36 @@ pub struct ServerNegotiation {
     pub advertised_receive: AdvertisedReceive,
 }
 
-/// Reproduce sing-quic's server negotiation with `IgnoreClientBandwidth=false`.
+/// Negotiate Hysteria2 congestion control for one authenticated connection.
 ///
-/// A client declaring RX zero chooses BBR in both halves of the exchange, so the
-/// response is the literal extension value `auto` even when `down_mbps` is set.
-/// Otherwise the two directions are independent: the server installs Brutal using
-/// the client's declaration capped by `up_mbps`, and advertises `down_mbps`
-/// numerically (including zero, which means uncapped to sing-quic clients).
+/// With `ignore_client_bandwidth=false`, the two directions stay independent. A
+/// zero client declaration keeps the server-to-client half on BBR, but the server
+/// still advertises `down_mbps` numerically. In particular, numeric zero means
+/// "uncapped" and lets a client with a configured upload rate select Brutal; it is
+/// deliberately different from the literal `auto`, which forces that client to BBR.
+/// This is the native Hysteria and legacy sing-quic wire behaviour.
+///
+/// With `ignore_client_bandwidth=true`, the client's declaration is ignored, both
+/// sides are instructed to retain bandwidth detection, and `up_mbps`/`down_mbps`
+/// do not participate in the exchange.
 pub fn negotiate_server(
     client_receive_bps: u64,
     server_up_mbps: u64,
     server_down_mbps: u64,
+    ignore_client_bandwidth: bool,
 ) -> ServerNegotiation {
-    match negotiated_send_bps(client_receive_bps, server_up_mbps) {
-        None => ServerNegotiation {
+    if ignore_client_bandwidth {
+        ServerNegotiation {
             send_bps: None,
             advertised_receive: AdvertisedReceive::Auto,
-        },
-        Some(send_bps) => ServerNegotiation {
-            send_bps: Some(send_bps),
+        }
+    } else {
+        ServerNegotiation {
+            send_bps: negotiated_send_bps(client_receive_bps, server_up_mbps),
             advertised_receive: AdvertisedReceive::BytesPerSecond(advertised_receive_bps(
                 server_down_mbps,
             )),
-        },
+        }
     }
 }
 
@@ -428,17 +435,17 @@ mod tests {
     }
 
     #[test]
-    fn server_negotiation_matches_sing_quic_vectors() {
+    fn server_negotiation_distinguishes_uncapped_from_auto() {
         assert_eq!(
-            negotiate_server(0, 100, 200),
+            negotiate_server(0, 100, 0, false),
             ServerNegotiation {
                 send_bps: None,
-                advertised_receive: AdvertisedReceive::Auto,
+                advertised_receive: AdvertisedReceive::BytesPerSecond(0),
             },
-            "an RX=0 request keeps BBR and writes the literal auto extension"
+            "an RX=0 request keeps the server on BBR but advertises uncapped client upload"
         );
         assert_eq!(
-            negotiate_server(8_000_000, 0, 37),
+            negotiate_server(8_000_000, 0, 37, false),
             ServerNegotiation {
                 send_bps: Some(8_000_000),
                 advertised_receive: AdvertisedReceive::BytesPerSecond(4_625_000),
@@ -446,7 +453,7 @@ mod tests {
             "an absent server upload cap leaves the client's rate intact"
         );
         assert_eq!(
-            negotiate_server(20_000_000, 100, 0),
+            negotiate_server(20_000_000, 100, 0, false),
             ServerNegotiation {
                 send_bps: Some(12_500_000),
                 advertised_receive: AdvertisedReceive::BytesPerSecond(0),
@@ -454,16 +461,24 @@ mod tests {
             "the upload cap and numeric zero in the opposite direction are independent"
         );
         assert_eq!(
-            negotiate_server(8_000_000, 100, 200)
+            negotiate_server(8_000_000, 100, 200, false)
                 .advertised_receive
                 .header_value(),
             "25000000"
         );
         assert_eq!(
-            negotiate_server(0, 100, 200)
+            negotiate_server(0, 100, 0, false)
                 .advertised_receive
                 .header_value(),
-            "auto"
+            "0"
+        );
+        assert_eq!(
+            negotiate_server(8_000_000, 100, 200, true),
+            ServerNegotiation {
+                send_bps: None,
+                advertised_receive: AdvertisedReceive::Auto,
+            },
+            "ignoring client bandwidth keeps both directions on bandwidth detection"
         );
     }
 

@@ -1676,6 +1676,7 @@ mod tests {
             true,
             100,
             100,
+            false,
             Some(Salamander::new("test-obfs")),
             Arc::new(Hysteria2Masquerade::new(None).unwrap()),
             shutdown.clone(),
