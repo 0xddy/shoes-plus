@@ -1942,6 +1942,102 @@ mod tests {
     }
 
     #[test]
+    fn stopped_writer_reports_error_when_send_window_is_full() {
+        stopped_writer_reports_error_when_connection_blocked(false);
+    }
+
+    #[test]
+    fn stopped_writer_reports_error_when_max_data_is_exhausted() {
+        stopped_writer_reports_error_when_connection_blocked(true);
+    }
+
+    fn stopped_writer_reports_error_when_connection_blocked(max_data_limited: bool) {
+        const WINDOW: u32 = 32 * 1024;
+        let mut server = make(Side::Server);
+        server.set_send_window(u64::from(if max_data_limited {
+            2 * WINDOW
+        } else {
+            WINDOW
+        }));
+        server.set_params(&TransportParameters {
+            initial_max_data: (if max_data_limited { WINDOW } else { 2 * WINDOW }).into(),
+            initial_max_stream_data_uni: (4 * WINDOW).into(),
+            initial_max_streams_uni: 2u32.into(),
+            ..TransportParameters::default()
+        });
+        let conn_state = ConnState::Established;
+        let mut pending = Retransmits::default();
+        let mut streams = Streams {
+            state: &mut server,
+            conn_state: &conn_state,
+        };
+        let download_id = streams.open(Dir::Uni).unwrap();
+        let next_id = streams.open(Dir::Uni).unwrap();
+
+        let mut download = SendStream {
+            id: download_id,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &conn_state,
+        };
+        assert_eq!(
+            download.write(&vec![b'd'; WINDOW as usize]),
+            Ok(WINDOW as usize)
+        );
+        assert_eq!(download.write(b"more"), Err(WriteError::Blocked));
+        assert_eq!(download.state.write_limit(), 0);
+
+        let mut next = SendStream {
+            id: next_id,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &conn_state,
+        };
+        assert_eq!(next.write(b"probe"), Err(WriteError::Blocked));
+
+        // A canceled download wakes the existing writer even though no send
+        // allowance has become available. It must observe the terminal error,
+        // allowing its owner to reset/drop it and release the shared window.
+        let reason = 42u32.into();
+        server.received_stop_sending(download_id, reason);
+        assert_eq!(
+            server.poll(),
+            Some(StreamEvent::Stopped {
+                id: download_id,
+                error_code: reason
+            })
+        );
+        let mut download = SendStream {
+            id: download_id,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &conn_state,
+        };
+        assert_eq!(download.write(b"more"), Err(WriteError::Stopped(reason)));
+        download.reset(reason).unwrap();
+        assert_eq!(download.write(b"more"), Err(WriteError::ClosedStream));
+        assert_eq!(download.state.unacked_data, 0);
+        if max_data_limited {
+            // A reset restores local buffer allowance, not peer-owned flow
+            // control. The peer issues MAX_DATA when it discards the download.
+            assert_eq!(download.state.write_limit(), 0);
+            download.state.received_max_data((2 * WINDOW).into());
+        }
+        assert!(download.state.write_limit() > 0);
+        assert_eq!(
+            download.state.poll(),
+            Some(StreamEvent::Writable { id: next_id })
+        );
+        let mut next = SendStream {
+            id: next_id,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &conn_state,
+        };
+        assert_eq!(next.write(b"probe"), Ok(5));
+    }
+
+    #[test]
     fn expand_send_window() {
         let mut server = make(Side::Server);
 

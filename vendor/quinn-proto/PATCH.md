@@ -118,7 +118,7 @@ blocks, each with MTU padding enabled and disabled. They decrypt the ACK packet,
 verify that no queued STREAM/MAX_DATA bypasses congestion control, then release
 the outstanding traffic and verify the complete 1 MiB payload, FIN and saved
 MAX_DATA update. Both unpadded tests fail without the correction. All four pass
-with it; the complete vendored library suite has 286 passing tests.
+with it; the complete vendored library suite at that revision had 286 passing tests.
 
 This establishes a transport scheduling defect, not the cause of a particular
 WAN outage. Node-agent's direction-switch interoperability suite additionally
@@ -128,4 +128,52 @@ Run all vendor transport regressions (also used in CI):
 
 ```sh
 cargo test --manifest-path vendor/quinn-proto/Cargo.toml --locked --lib
+```
+
+## Report stopped writers even when connection credit is exhausted
+
+This local correction makes terminal send-stream errors take precedence over
+connection-wide write allowance. Previously `SendStream::write_source` returned
+`Blocked` for a full local `send_window` or exhausted peer `MAX_DATA` before
+checking the stream's closed state or `STOP_SENDING` reason. Quinn delivered the
+`StreamEvent::Stopped` wakeup, but the writer immediately waited again. Its owner
+could therefore miss the error that should end a canceled download and drop or
+reset the stream, retaining resources needed by subsequent requests.
+
+Check closed/stopped state before the connection allowance check, preserving
+the existing `ClosedStream`/`Stopped` error precedence used when credit is
+available. The reviewed [SagerNet quic-go send-stream implementation](https://github.com/SagerNet/quic-go/blob/v0.61.0-sing-box-mod.7/send_stream.go)
+likewise checks reset, shutdown, and finished-writing state before enqueueing a
+write and waiting for flow-control progress. Its per-stream behavior is a source
+comparison, not a replacement of Quinn's scheduler or buffering model.
+
+Two deterministic private-module regressions first exhaust either `send_window`
+or `MAX_DATA`, block an existing download writer and a subsequent probe writer,
+then deliver `STOP_SENDING(42)`. Both fail without the correction: the existing
+writer returns `Blocked` instead of `Stopped(42)`. With it, the terminal error is
+observable, reset clears the canceled data from `unacked_data`, and the next
+writer receives `Writable` and successfully writes its probe. The full vendored
+library suite passes 288 tests with this change.
+
+Reset only restores local send-buffer allowance. It does **not** create peer
+flow-control credit or reduce `data_sent`. The `MAX_DATA` test explicitly remains
+blocked after reset until the peer legally advertises additional `MAX_DATA`.
+Connection and stream flow-control limits are otherwise unchanged.
+
+The node-agent-rs test `quinn_stopped_writer` additionally exercises real loopback
+UDP and public Quinn APIs. Its client legally advertises an initial receive
+window of zero, starts a bidirectional request, then stops the explicitly pending
+server writer. No received payload is discarded, so automatic `MAX_DATA` credit
+cannot mask the ordering defect. Without the correction the writer remains
+pending past the five-second deadline; with it, `Stopped(42)` arrives, the writer
+is dropped, and a new request succeeds on the same QUIC connection after the
+client explicitly expands its receive window. An outer 20-second deadline bounds
+the complete scenario. This is a transport regression, not a claim that browser
+Speedtest advertises a zero initial window; ordinary cancellation may return
+credit immediately and conceal the old branch.
+
+```sh
+cargo test --manifest-path vendor/quinn-proto/Cargo.toml --locked --lib stopped_writer_reports_error
+# In the sibling node-agent-rs workspace:
+cargo test --locked -p shoes-engine --test quinn_stopped_writer
 ```
