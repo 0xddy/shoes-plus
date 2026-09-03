@@ -76,6 +76,13 @@ impl<T> EventReceiver<T> {
             .poll_recv(cx)
             .map(|event| event.map(|queued| queued.event))
     }
+
+    /// Stop routing to a dead driver and release its queued packet allocations
+    /// even when application connection/stream handles remain alive.
+    pub(crate) fn close_and_drain(&mut self) {
+        self.receiver.close();
+        while self.receiver.try_recv().is_ok() {}
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +178,32 @@ mod tests {
             sender.packet_budget.available_permits(),
             MAX_PENDING_PACKETS
         );
+    }
+
+    #[tokio::test]
+    async fn aborting_receiver_releases_queued_packets_and_refuses_new_events() {
+        let event = Arc::new(());
+        let (sender, mut receiver) = channel();
+        for _ in 0..MAX_PENDING_PACKETS {
+            assert!(sender.send_packet(Arc::clone(&event)));
+        }
+        sender.send(Arc::clone(&event)).unwrap();
+        assert_eq!(Arc::strong_count(&event), MAX_PENDING_PACKETS + 2);
+
+        receiver.close_and_drain();
+        assert_eq!(Arc::strong_count(&event), 1);
+        assert_eq!(
+            sender.packet_budget.available_permits(),
+            MAX_PENDING_PACKETS
+        );
+        assert!(!sender.send_packet(Arc::clone(&event)));
+        assert!(sender.send(Arc::clone(&event)).is_err());
+        assert_eq!(Arc::strong_count(&event), 1);
+        assert_eq!(
+            sender.packet_budget.available_permits(),
+            MAX_PENDING_PACKETS
+        );
+        assert_eq!(poll_fn(|cx| receiver.poll_recv(cx)).await, None);
     }
 
     #[tokio::test]

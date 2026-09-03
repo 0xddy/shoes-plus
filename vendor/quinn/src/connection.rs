@@ -253,7 +253,16 @@ impl Future for ConnectionDriver {
             conn.terminate(e, &self.0.shared);
             return Poll::Ready(Ok(()));
         }
-        let mut keep_going = conn.drive_transmit(cx)?;
+        let mut keep_going = match conn.drive_transmit(cx) {
+            Ok(keep_going) => keep_going,
+            Err(error) => {
+                // The driver is about to exit. Application handles can outlive
+                // it, so dropping the driver alone cannot close their waiters
+                // or release the endpoint's connection/CID registration.
+                conn.terminate_on_io_error(&error, &self.0.shared);
+                return Poll::Ready(Err(error));
+            }
+        };
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
@@ -901,6 +910,7 @@ impl ConnectionRef {
                 timer_deadline: None,
                 conn_events,
                 endpoint_events,
+                endpoint_drained: false,
                 blocked_writers: FxHashMap::default(),
                 blocked_readers: FxHashMap::default(),
                 stopped: FxHashMap::default(),
@@ -983,6 +993,9 @@ pub(crate) struct State {
     timer_deadline: Option<Instant>,
     conn_events: EventReceiver<ConnectionEvent>,
     endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+    /// An early driver failure must release endpoint routing exactly once,
+    /// even when application handles keep this State alive afterwards.
+    endpoint_drained: bool,
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
     pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
     pub(crate) stopped: FxHashMap<StreamId, Arc<Notify>>,
@@ -1067,9 +1080,19 @@ impl State {
 
     fn forward_endpoint_events(&mut self) {
         while let Some(event) = self.inner.poll_endpoint_events() {
-            // If the endpoint driver is gone, noop.
-            let _ = self.endpoint_events.send((self.handle, event));
+            self.forward_endpoint_event(event);
         }
+    }
+
+    fn forward_endpoint_event(&mut self, event: EndpointEvent) {
+        if event.is_drained() {
+            if self.endpoint_drained {
+                return;
+            }
+            self.endpoint_drained = true;
+        }
+        // If the endpoint driver is gone, noop.
+        let _ = self.endpoint_events.send((self.handle, event));
     }
 
     /// If this returns `Err`, the endpoint is dead, so the driver should exit immediately.
@@ -1229,6 +1252,30 @@ impl State {
         shared.closed.notify_waiters();
     }
 
+    /// Abort locally after a fatal socket error. The failed socket cannot be
+    /// relied upon to send CONNECTION_CLOSE or drive a normal draining timer.
+    fn terminate_on_io_error(&mut self, error: &io::Error, shared: &Shared) {
+        let reason = self.error.clone().unwrap_or_else(|| {
+            ConnectionError::TransportError(proto::TransportError {
+                code: proto::TransportErrorCode::INTERNAL_ERROR,
+                frame: None,
+                reason: format!("local UDP I/O error ({:?}): {error}", error.kind()),
+            })
+        });
+        // Make surviving handles observe a closed protocol state, without
+        // replacing an earlier transport/application closure reason.
+        self.inner
+            .close(self.runtime.now(), 0u32.into(), Bytes::new());
+        self.terminate(reason, shared);
+        self.driver = None;
+        self.timer = None;
+        self.timer_deadline = None;
+        self.buffered_transmit = None;
+        self.send_buffer.clear();
+        self.conn_events.close_and_drain();
+        self.forward_endpoint_event(proto::EndpointEvent::drained());
+    }
+
     fn close(&mut self, error_code: VarInt, reason: Bytes, shared: &Shared) {
         self.inner.close(self.runtime.now(), error_code, reason);
         self.terminate(ConnectionError::LocallyClosed, shared);
@@ -1254,7 +1301,7 @@ impl State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        if !self.inner.is_drained() {
+        if !self.inner.is_drained() && !self.endpoint_drained {
             // Ensure the endpoint can tidy up
             let _ = self
                 .endpoint_events

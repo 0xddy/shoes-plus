@@ -39,6 +39,8 @@ use tracing_subscriber::EnvFilter;
 
 use super::{ClientConfig, Endpoint, EndpointConfig, RecvStream, SendStream, TransportConfig};
 
+mod io_error;
+
 #[test]
 fn handshake_timeout() {
     let _guard = subscribe();
