@@ -376,6 +376,7 @@ impl UserContext {
         authenticated: bool,
         cancel_on_failure: bool,
     ) -> Option<u64> {
+        let mut refused_limit = None;
         let id = {
             let mut connections = self.connections();
             if connections.revoked || (authenticated && !self.is_enabled()) {
@@ -384,11 +385,7 @@ impl UserContext {
                 // Refused, and deliberately not counted in `total_conns`: the
                 // credential was good but the connection never existed, so counting
                 // it would make the lifetime figure a count of attempts.
-                log::debug!(
-                    "refusing a connection for {}: at the {} connection limit",
-                    self.id,
-                    self.max_conns()
-                );
+                refused_limit = Some(self.max_conns());
                 None
             } else {
                 if authenticated {
@@ -405,6 +402,13 @@ impl UserContext {
             }
         };
 
+        if let Some(limit) = refused_limit {
+            log::debug!(
+                "refusing a connection for {}: at the {} connection limit",
+                self.id,
+                limit
+            );
+        }
         if id.is_none() && cancel_on_failure {
             token.cancel();
         }

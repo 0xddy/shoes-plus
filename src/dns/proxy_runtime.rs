@@ -285,6 +285,11 @@ impl ProxyQuicShared {
     fn connected(&self, stream: Box<dyn AsyncMessageStream>) {
         let waker = {
             let mut state = self.state.lock();
+            // Socket destruction can race a completed proxy connection on
+            // another runtime worker. Never resurrect the closed transport.
+            if matches!(state.transport, ProxyQuicTransport::Failed(_)) {
+                return;
+            }
             state.transport = ProxyQuicTransport::Connected(stream);
             state.read_waker.take()
         };
@@ -324,6 +329,21 @@ struct ProxyQuicSocket {
     server_addr: SocketAddr,
     shared: Arc<ProxyQuicShared>,
     send_tx: mpsc::Sender<Vec<u8>>,
+    // The writer must not outlive the socket while waiting for a proxy to drain.
+    // Channel closure alone cannot interrupt a pending connect/write/flush.
+    worker: tokio::task::AbortHandle,
+}
+
+impl Drop for ProxyQuicSocket {
+    fn drop(&mut self) {
+        self.worker.abort();
+        // A Quinn poller can retain `shared` after dropping the socket. Release
+        // the transport now and make that remaining poller fail closed.
+        self.shared.fail(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "QUIC proxy socket closed",
+        ));
+    }
 }
 
 impl std::fmt::Debug for ProxyQuicSocket {
@@ -343,6 +363,25 @@ impl ProxyQuicSocket {
         resolver: Arc<dyn Resolver>,
         connect_timeout: Duration,
     ) -> io::Result<Arc<Self>> {
+        Self::spawn_connecting(local_addr, server_addr, connect_timeout, async move {
+            let address = match server_addr.ip() {
+                IpAddr::V4(address) => Address::Ipv4(address),
+                IpAddr::V6(address) => Address::Ipv6(address),
+            };
+            let location = NetLocation::new(address, server_addr.port());
+            let target = ResolvedLocation::with_resolved(location, server_addr);
+            chain_group
+                .connect_udp_bidirectional(&resolver, target)
+                .await
+        })
+    }
+
+    fn spawn_connecting(
+        local_addr: SocketAddr,
+        server_addr: SocketAddr,
+        connect_timeout: Duration,
+        connect: impl Future<Output = io::Result<Box<dyn AsyncMessageStream>>> + Send + 'static,
+    ) -> io::Result<Arc<Self>> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
             io::Error::other(format!(
                 "DNS-over-QUIC proxy detour requires a Tokio runtime: {error}"
@@ -350,21 +389,9 @@ impl ProxyQuicSocket {
         })?;
         let shared = Arc::new(ProxyQuicShared::new_connecting());
         let (send_tx, send_rx) = mpsc::channel(PROXY_QUIC_SEND_QUEUE_CAPACITY);
-        let socket = Arc::new(Self {
-            local_addr,
-            server_addr,
-            shared: shared.clone(),
-            send_tx,
-        });
-
-        runtime.spawn(async move {
-            let address = match server_addr.ip() {
-                IpAddr::V4(address) => Address::Ipv4(address),
-                IpAddr::V6(address) => Address::Ipv6(address),
-            };
-            let location = NetLocation::new(address, server_addr.port());
-            let target = ResolvedLocation::with_resolved(location, server_addr);
-            let connect = chain_group.connect_udp_bidirectional(&resolver, target);
+        let task_shared = shared.clone();
+        let worker = runtime.spawn(async move {
+            let shared = task_shared;
             let stream = match tokio::time::timeout(connect_timeout, connect).await {
                 Ok(Ok(stream)) => stream,
                 Ok(Err(error)) => {
@@ -390,7 +417,13 @@ impl ProxyQuicSocket {
             run_proxy_quic_writer(shared, send_rx).await;
         });
 
-        Ok(socket)
+        Ok(Arc::new(Self {
+            local_addr,
+            server_addr,
+            shared,
+            send_tx,
+            worker: worker.abort_handle(),
+        }))
     }
 
     #[cfg(test)]
@@ -402,12 +435,13 @@ impl ProxyQuicSocket {
         let shared = Arc::new(ProxyQuicShared::new_connecting());
         shared.connected(stream);
         let (send_tx, send_rx) = mpsc::channel(PROXY_QUIC_SEND_QUEUE_CAPACITY);
-        tokio::spawn(run_proxy_quic_writer(shared.clone(), send_rx));
+        let worker = tokio::spawn(run_proxy_quic_writer(shared.clone(), send_rx));
         Arc::new(Self {
             local_addr,
             server_addr,
             shared,
             send_tx,
+            worker: worker.abort_handle(),
         })
     }
 }
@@ -626,6 +660,166 @@ mod tests {
     };
     use crate::resolver::NativeResolver;
     use crate::tcp::chain_builder::build_direct_chain_group;
+    use crate::vless::VlessMessageStream;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    struct BackpressuredStream {
+        inner: tokio::io::DuplexStream,
+        blocked: Arc<AtomicBool>,
+        _dropped: DropSignal,
+    }
+
+    impl tokio::io::AsyncRead for BackpressuredStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for BackpressuredStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let result = Pin::new(&mut self.inner).poll_write(cx, bytes);
+            if result.is_pending() {
+                self.blocked.store(true, Ordering::SeqCst);
+            }
+            result
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for BackpressuredStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for BackpressuredStream {}
+
+    async fn wait_for_worker_stop(worker: &tokio::task::AbortHandle) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !worker.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("socket destruction must stop its worker");
+    }
+
+    #[tokio::test]
+    async fn dropping_proxy_quic_socket_cancels_pending_connect() {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (dropped, released) = tokio::sync::oneshot::channel();
+        let lifetime = DropSignal(Some(dropped));
+        let socket = ProxyQuicSocket::spawn_connecting(
+            "0.0.0.0:0".parse().unwrap(),
+            "192.0.2.53:853".parse().unwrap(),
+            Duration::from_secs(60),
+            async move {
+                let _lifetime = lifetime;
+                let _ = entered.send(());
+                std::future::pending().await
+            },
+        )
+        .unwrap();
+        let worker = socket.worker.clone();
+        started.await.unwrap();
+        drop(socket);
+        tokio::time::timeout(Duration::from_secs(1), released)
+            .await
+            .expect("drop must cancel the connect before its timeout")
+            .unwrap();
+        wait_for_worker_stop(&worker).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_proxy_quic_socket_releases_backpressured_stream_and_idle_writer() {
+        // Retain a Quinn poller and the remote peer throughout destruction. An
+        // empty queue and a stalled VLESS flush must both release their worker.
+        for send_packet in [false, true] {
+            let (stream, peer) = tokio::io::duplex(1);
+            let blocked = Arc::new(AtomicBool::new(false));
+            let (dropped, released) = tokio::sync::oneshot::channel();
+            let socket = ProxyQuicSocket::from_connected_stream(
+                "0.0.0.0:0".parse().unwrap(),
+                "192.0.2.53:853".parse().unwrap(),
+                Box::new(VlessMessageStream::new(BackpressuredStream {
+                    inner: stream,
+                    blocked: blocked.clone(),
+                    _dropped: DropSignal(Some(dropped)),
+                })),
+            );
+            let worker = socket.worker.clone();
+            let mut poller = quinn::AsyncUdpSocket::create_io_poller(socket.clone());
+            if send_packet {
+                socket.send_tx.send(vec![7; 1400]).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while !blocked.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the small duplex buffer must backpressure the VLESS flush");
+            } else {
+                tokio::task::yield_now().await;
+            }
+            drop(socket);
+            tokio::time::timeout(Duration::from_secs(1), released)
+                .await
+                .expect("a remaining poller must not retain the proxy stream")
+                .unwrap();
+            wait_for_worker_stop(&worker).await;
+            let error = poll_fn(|cx| poller.as_mut().poll_writable(cx))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            drop(peer);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_proxy_quic_state_rejects_late_connection_completion() {
+        let shared = ProxyQuicShared::new_connecting();
+        shared.fail(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
+        let (stream, _peer) = tokio::io::duplex(1);
+        let (dropped, released) = tokio::sync::oneshot::channel();
+        shared.connected(Box::new(VlessMessageStream::new(BackpressuredStream {
+            inner: stream,
+            blocked: Arc::new(AtomicBool::new(false)),
+            _dropped: DropSignal(Some(dropped)),
+        })));
+        released
+            .await
+            .expect("a late stream is dropped without publication");
+        assert_eq!(shared.error().unwrap().kind(), io::ErrorKind::BrokenPipe);
+    }
 
     struct MockMessageStream {
         inbound: mpsc::UnboundedReceiver<Vec<u8>>,
