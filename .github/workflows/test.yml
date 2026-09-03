@@ -45,5 +45,5 @@ jobs:
     - name: Run tests
       run: cargo test --all-targets --locked
 
-    - name: Test vendored QUIC datagram accounting
-      run: cargo test --manifest-path vendor/quinn-proto/Cargo.toml --locked --lib connection::datagrams::tests
+    - name: Test vendored QUIC transport
+      run: cargo test --manifest-path vendor/quinn-proto/Cargo.toml --locked --lib

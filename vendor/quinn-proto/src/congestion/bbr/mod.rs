@@ -324,7 +324,7 @@ impl Bbr {
         // time.
         if self.is_at_full_bandwidth {
             self.cwnd = target_window.min(self.cwnd + bytes_acked);
-        } else if (self.cwnd_gain < target_window as f32) || (self.acked_bytes < self.init_cwnd) {
+        } else if (self.cwnd < target_window) || (self.acked_bytes < self.init_cwnd) {
             // If the connection is not yet out of startup phase, do not decrease
             // the window.
             self.cwnd += bytes_acked;
@@ -649,3 +649,126 @@ const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
 
 const PROBE_RTT_BASED_ON_BDP: bool = true;
 const DRAIN_TO_TARGET: bool = true;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Model completed RTTs without timers or real network scheduling. These
+    // regressions follow upstream PR #2798's application-limited tunnel cases.
+    fn run_round(
+        bbr: &mut Bbr,
+        now: Instant,
+        packet_number: &mut u64,
+        spacing: Duration,
+        app_limited: bool,
+    ) -> Instant {
+        const PACKETS: u64 = 33;
+        let rtt = RttEstimator::new(Duration::from_millis(20));
+        let first_packet = *packet_number;
+        let mut sent = now;
+        for _ in 0..PACKETS {
+            bbr.on_sent(sent, 1200, *packet_number);
+            *packet_number += 1;
+            sent += spacing;
+        }
+        let mut acked = now + Duration::from_millis(20);
+        for _ in 0..PACKETS {
+            bbr.on_ack(acked, now, 1200, app_limited, &rtt);
+            acked += spacing;
+        }
+        bbr.on_end_acks(acked, 0, app_limited, Some(first_packet + PACKETS - 1));
+        acked
+    }
+
+    fn startup_controller(now: Instant) -> Bbr {
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        // Isolate STARTUP arithmetic from the initial ProbeRtt phase; later
+        // application-limited rounds do not trigger a new ProbeRtt phase.
+        bbr.probe_rtt_last_started_at = Some(now);
+        bbr.min_rtt = Duration::from_millis(20);
+        bbr
+    }
+
+    #[test]
+    fn app_limited_startup_keeps_cwnd_near_the_estimated_target() {
+        let mut now = Instant::now();
+        let mut bbr = startup_controller(now);
+        let mut packet_number = 0;
+        let mut spacing = Duration::from_micros(1000);
+        // Seed an increasing bandwidth estimate without leaving STARTUP.
+        for _ in 0..4 {
+            now = run_round(&mut bbr, now, &mut packet_number, spacing, false);
+            spacing /= 2;
+        }
+        assert_eq!(bbr.mode, Mode::Startup);
+        for _ in 0..500 {
+            now = run_round(
+                &mut bbr,
+                now,
+                &mut packet_number,
+                Duration::from_micros(600),
+                true,
+            );
+        }
+        assert_eq!(bbr.mode, Mode::Startup);
+        assert!(bbr.acked_bytes > 20 * bbr.init_cwnd);
+        assert!(
+            bbr.cwnd <= 4 * bbr.init_cwnd,
+            "STARTUP cwnd {} must not follow cumulative ACK bytes {}",
+            bbr.cwnd,
+            bbr.acked_bytes
+        );
+    }
+
+    #[test]
+    fn app_limited_from_birth_keeps_cwnd_bounded() {
+        let mut now = Instant::now();
+        let mut bbr = startup_controller(now);
+        let mut packet_number = 0;
+        for _ in 0..500 {
+            now = run_round(
+                &mut bbr,
+                now,
+                &mut packet_number,
+                Duration::from_micros(600),
+                true,
+            );
+        }
+        assert_eq!(bbr.mode, Mode::Startup);
+        assert!(bbr.acked_bytes > 20 * bbr.init_cwnd);
+        assert!(
+            bbr.cwnd <= 4 * bbr.init_cwnd,
+            "app-limited cwnd {} must not follow cumulative ACK bytes {}",
+            bbr.cwnd,
+            bbr.acked_bytes
+        );
+    }
+
+    #[test]
+    fn startup_still_grows_toward_a_large_bandwidth_target() {
+        let mut now = Instant::now();
+        let mut bbr = startup_controller(now);
+        let mut packet_number = 0;
+        for _ in 0..2 {
+            now = run_round(
+                &mut bbr,
+                now,
+                &mut packet_number,
+                Duration::from_micros(10),
+                false,
+            );
+        }
+        for _ in 0..100 {
+            now = run_round(
+                &mut bbr,
+                now,
+                &mut packet_number,
+                Duration::from_micros(10),
+                true,
+            );
+        }
+        assert_eq!(bbr.mode, Mode::Startup);
+        assert!(bbr.cwnd > 10 * bbr.init_cwnd);
+    }
+}

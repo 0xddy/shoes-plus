@@ -547,6 +547,7 @@ impl Connection {
             if space_id == SpaceId::Data {
                 ack_eliciting |= self.can_send_1rtt(frame_space_1rtt);
             }
+            let mut ack_only = false;
 
             pad_datagram_to_mtu |= space_id == SpaceId::Data && self.config.pad_to_mtu;
 
@@ -604,29 +605,49 @@ impl Connection {
 
                     let bytes_to_send = segment_size as u64 + untracked_bytes;
                     if self.path.in_flight.bytes + bytes_to_send >= self.path.congestion.window() {
-                        space_idx += 1;
                         congestion_blocked = true;
-                        // We continue instead of breaking here in order to avoid
-                        // blocking loss probes queued for higher spaces.
                         trace!("blocked by congestion control");
-                        continue;
+                        if can_send.acks && !close {
+                            // Due ACKs are not congestion controlled. Keep queued
+                            // STREAM/control frames pending and acknowledge the
+                            // peer even while our outgoing data cannot advance.
+                            ack_only = true;
+                            ack_eliciting = false;
+                        } else {
+                            // Continue instead of breaking to avoid blocking
+                            // loss probes queued for higher spaces.
+                            space_idx += 1;
+                            continue;
+                        }
                     }
 
                     // Check whether the next datagram is blocked by pacing
                     let smoothed_rtt = self.path.rtt.get();
-                    if let Some(delay) = self.path.pacing.delay(
-                        smoothed_rtt,
-                        bytes_to_send,
-                        self.path.current_mtu(),
-                        self.path.congestion.window(),
-                        now,
-                    ) {
+                    let pacing_delay = if ack_only {
+                        None
+                    } else {
+                        self.path.pacing.delay(
+                            smoothed_rtt,
+                            bytes_to_send,
+                            self.path.current_mtu(),
+                            self.path.congestion.window(),
+                            now,
+                        )
+                    };
+                    if let Some(delay) = pacing_delay {
                         self.timers.set(Timer::Pacing, delay);
                         congestion_blocked = true;
                         // Loss probes should be subject to pacing, even though
                         // they are not congestion controlled.
                         trace!("blocked by pacing");
-                        break;
+                        if can_send.acks && !close {
+                            // Sending queued application data must not delay
+                            // acknowledgement of reverse-direction traffic.
+                            ack_only = true;
+                            ack_eliciting = false;
+                        } else {
+                            break;
+                        }
                     }
                 }
 
@@ -847,7 +868,7 @@ impl Connection {
 
             // Send an off-path PATH_RESPONSE. Prioritized over on-path data to ensure that path
             // validation can occur while the link is saturated.
-            if space_id == SpaceId::Data && num_datagrams == 1 {
+            if !ack_only && space_id == SpaceId::Data && num_datagrams == 1 {
                 if let Some((token, remote)) = self.path_responses.pop_off_path(self.path.remote) {
                     // `unwrap` guaranteed to succeed because `builder_storage` was populated just
                     // above.
@@ -877,8 +898,20 @@ impl Connection {
                 }
             }
 
-            let sent =
-                self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
+            let sent = if ack_only {
+                let mut sent = SentFrames::default();
+                Self::populate_acks(
+                    now,
+                    self.receiving_ecn,
+                    &mut sent,
+                    &mut self.spaces[space_id],
+                    buf,
+                    &mut self.stats,
+                );
+                sent
+            } else {
+                self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number)
+            };
 
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
             // any other reason, there is a bug which leads to one component announcing write

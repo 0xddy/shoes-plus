@@ -62,7 +62,11 @@ impl BandwidthEstimation {
         };
 
         let bandwidth = send_rate.min(ack_rate);
-        if !app_limited && self.max_filter.get() < bandwidth {
+        // Non-app-limited samples must advance the window even when lower than
+        // its current maximum, so an old peak can expire. App-limited samples
+        // may raise the estimate, but cannot establish a lower path capacity.
+        // Same-instant deltas yield zero and are not delivery-rate samples.
+        if bandwidth > 0 && (!app_limited || bandwidth > self.max_filter.get()) {
             self.max_filter.update_max(round, bandwidth);
         }
     }
@@ -97,5 +101,31 @@ impl Display for BandwidthEstimation {
             "{:.3} MB/s",
             self.get_estimate() as f32 / (1024 * 1024) as f32
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lower_non_app_limited_samples_expire_a_past_bandwidth_peak() {
+        let mut estimator = BandwidthEstimation::default();
+        let mut now = Instant::now();
+        estimator.on_sent(now, 1200);
+        estimator.on_ack(now + Duration::from_millis(20), now, 1200, 0, false);
+        now += Duration::from_millis(1);
+        estimator.on_sent(now, 1200);
+        estimator.on_ack(now + Duration::from_millis(20), now, 1200, 1, false);
+        assert_eq!(estimator.get_estimate(), 1_200_000);
+
+        // Actual delivery falls below the previous peak for longer than the
+        // ten-round max-filter window. A historical peak must not persist forever.
+        for round in 2..25 {
+            now += Duration::from_millis(10);
+            estimator.on_sent(now, 1200);
+            estimator.on_ack(now + Duration::from_millis(20), now, 1200, round, false);
+        }
+        assert_eq!(estimator.get_estimate(), 120_000);
     }
 }

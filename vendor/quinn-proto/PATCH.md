@@ -1,4 +1,4 @@
-# Quinn stream reassembly backport
+# Quinn transport corrections
 
 Base: crates.io `quinn-proto` 0.11.17, unchanged MIT / Apache-2.0 licensing.
 The original normalized manifest, source and embedded tests are retained.
@@ -60,3 +60,72 @@ cargo test --manifest-path vendor/quinn-proto/Cargo.toml --locked --lib connecti
 
 The standalone lockfile is committed solely to make these vendor unit tests
 reproducible. Production builds continue to use their workspace root lockfile.
+
+## BBR application-limited STARTUP and bandwidth sample admission
+
+Backport the two arithmetic/admission corrections proposed in upstream
+[PR #2798](https://github.com/quinn-rs/quinn/pull/2798), head
+`fd3881f93ede58f4a4daf524cf39e1dc1ac9364b` (open and unmerged when reviewed on
+2026-09-03). The upstream issue and local regressions demonstrate defects in
+the vendored 0.11.17 BBR implementation:
+
+- STARTUP compared a dimensionless congestion-window gain with a target byte
+  count, effectively growing the window with cumulative acknowledged traffic
+  when an application-limited tunnel remained in STARTUP. Compare the actual
+  congestion window with the target instead.
+- Admit positive non-application-limited delivery samples even when they are
+  lower than the current maximum, allowing the ten-round filter to expire old
+  peaks. Application-limited samples may raise the estimate, but not lower it.
+  Rejecting all such samples left a newly application-limited connection with
+  no bandwidth estimate and unbounded ACK-aggregation growth.
+
+Deterministic regressions cover application-limited STARTUP with and without
+a seeded estimate, expiration after delivery falls below a historical peak,
+and continued STARTUP growth toward a genuinely larger target. Before the
+fixes, both bounded-window tests grew to approximately 20 MB after about 20 MB
+of acknowledged traffic, and the bandwidth estimate stayed at 1,200,000 B/s
+after delivery fell to 120,000 B/s for more than ten rounds. Those three tests
+failed; the normal growth test passed. All four pass with the corrections.
+
+These fixes do not replace Quinn's experimental BBR algorithm, change its
+external pacer, or establish the cause of a particular WAN Speedtest stall.
+Download-to-upload transitions still need connection-level interoperability
+validation with ACK, flow-control, loss and pacing observations.
+
+```sh
+cargo test --manifest-path vendor/quinn-proto/Cargo.toml --locked --lib congestion::bbr
+```
+
+## Acknowledge reverse traffic while outgoing data is blocked
+
+When STREAM or ACK-eliciting control frames were pending, `poll_transmit`
+treated their packet space as congestion controlled before assembling frames.
+If the congestion window or pacer blocked those frames, it also skipped ACKs
+that were already due. Download traffic could consequently delay acknowledgement
+of a peer's simultaneous upload. Go's corresponding sender explicitly calls
+`maybeSendAckOnlyPacket` in its `SendAck` and `SendPacingLimited` paths:
+[quic-go v0.61.0](https://github.com/quic-go/quic-go/blob/v0.61.0/connection.go).
+
+On these blocked paths, fall back to emitting the due ACK alone. Keep queued
+STREAM, FIN and flow-control updates pending, and preserve the pacing wakeup.
+Anti-amplification checks still run first. Initial packet size rules and the
+existing optional `pad_to_mtu` policy (including accounting padding as in-flight
+bytes) are preserved. This changes ACK scheduling, not the configured congestion
+algorithm or the application's bandwidth limits.
+
+Four in-memory connection regressions cover congestion-window and pacing
+blocks, each with MTU padding enabled and disabled. They decrypt the ACK packet,
+verify that no queued STREAM/MAX_DATA bypasses congestion control, then release
+the outstanding traffic and verify the complete 1 MiB payload, FIN and saved
+MAX_DATA update. Both unpadded tests fail without the correction. All four pass
+with it; the complete vendored library suite has 286 passing tests.
+
+This establishes a transport scheduling defect, not the cause of a particular
+WAN outage. Node-agent's direction-switch interoperability suite additionally
+tests large ordinary transfers on one existing HY2 connection.
+
+Run all vendor transport regressions (also used in CI):
+
+```sh
+cargo test --manifest-path vendor/quinn-proto/Cargo.toml --locked --lib
+```

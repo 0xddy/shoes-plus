@@ -2614,6 +2614,134 @@ fn immediate_ack_triggers_ack() {
     assert_eq!(acks_after_ping - acks_after_connect, 1);
 }
 
+/// Pending stream data must not prevent acknowledgement of traffic in the
+/// reverse direction when the local sender is blocked by congestion or pacing.
+fn ack_when_send_blocked(pacing: bool, pad_to_mtu: bool) {
+    let _guard = subscribe();
+    let mut config = server_config();
+    let mut transport = TransportConfig::default();
+    transport.mtu_discovery_config(None);
+    transport.receive_window((64 * 1024u32).into());
+    transport.pad_to_mtu(pad_to_mtu);
+    if pacing {
+        let mut congestion = congestion::CubicConfig::default();
+        congestion.initial_window(256 * 1024);
+        transport.congestion_controller_factory(Arc::new(congestion));
+    }
+    config.transport = Arc::new(transport);
+    let mut pair = Pair::new(Default::default(), config);
+    if pacing {
+        // Establish a nonzero RTT so the pacer can block below the congestion
+        // window. The congestion-only case has zero RTT and disables pacing.
+        pair.latency = Duration::from_millis(20);
+    }
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+    pair.latency = Duration::ZERO;
+
+    let download = pair.server_streams(server_ch).open(Dir::Uni).unwrap();
+    let payload = vec![0x5a; 1024 * 1024];
+    assert_eq!(
+        pair.server_send(server_ch, download)
+            .write(&payload)
+            .unwrap(),
+        payload.len()
+    );
+    pair.server_send(server_ch, download).finish().unwrap();
+    let now = pair.time;
+    let client_addr = pair.client.addr;
+    pair.server.drive(now, client_addr);
+    assert!(!pair.server.outbound.is_empty());
+    // Keep the download's packets in flight while testing reverse-direction
+    // acknowledgements. Everything here is an in-memory protocol simulation.
+    let held_download = mem::take(&mut pair.server.outbound);
+    pair.server_conn_mut(server_ch)
+        .set_receive_window((128 * 1024u32).into());
+
+    let before = pair.server_conn_mut(server_ch).stats();
+    assert!(before.frame_tx.stream > 0);
+    pair.client_conn_mut(client_ch).immediate_ack();
+    pair.drive_client();
+    pair.drive_server();
+    let after = pair.server_conn_mut(server_ch).stats();
+    assert_eq!(
+        after.frame_rx.immediate_ack,
+        before.frame_rx.immediate_ack + 1
+    );
+    assert_eq!(
+        after.frame_tx.acks,
+        before.frame_tx.acks + 1,
+        "a due ACK must bypass blocked outgoing stream data"
+    );
+    assert_eq!(
+        after.frame_tx.stream, before.frame_tx.stream,
+        "sending an ACK must not bypass stream congestion control or pacing"
+    );
+    assert_eq!(
+        after.frame_tx.max_data, before.frame_tx.max_data,
+        "ACK-eliciting flow-control updates must remain pending too"
+    );
+    if pad_to_mtu {
+        assert_eq!(
+            after.udp_tx.bytes - before.udp_tx.bytes,
+            u64::from(after.path.current_mtu),
+            "ACK-only fallback must preserve configured packet padding"
+        );
+    }
+
+    // Inspect the wire packet, not just counters: queued stream data and FIN
+    // must remain pending when sending the congestion/pacing-exempt ACK.
+    pair.client.capture_inbound_packets = true;
+    pair.drive_client();
+    assert_eq!(pair.client.captured_packets.len(), 1);
+    for frame in frame::Iter::new(pair.client.captured_packets.remove(0).into()).unwrap() {
+        assert_matches!(frame.unwrap(), Frame::Ack(_) | Frame::Padding);
+    }
+    pair.client.capture_inbound_packets = false;
+
+    // Release the held packets. The ACK-only fallback must preserve the rest of
+    // the download and FIN, which can now drain after acknowledgements arrive.
+    pair.server.outbound.extend(held_download);
+    assert!(!pair.drive_bounded(), "download should resume and finish");
+    assert_eq!(
+        pair.server_conn_mut(server_ch).stats().frame_tx.max_data,
+        before.frame_tx.max_data + 1,
+        "the flow-control update must survive the ACK-only fallback"
+    );
+    assert_eq!(
+        pair.client_streams(client_ch).accept(Dir::Uni),
+        Some(download)
+    );
+    let mut recv = pair.client_recv(client_ch, download);
+    let mut chunks = recv.read(true).unwrap();
+    let mut received = Vec::new();
+    while let Some(chunk) = chunks.next(usize::MAX).unwrap() {
+        received.extend_from_slice(&chunk.bytes);
+    }
+    let _ = chunks.finalize();
+    assert_eq!(received, payload);
+}
+
+#[test]
+fn ack_when_congestion_window_blocks_stream_data() {
+    ack_when_send_blocked(false, false);
+}
+
+#[test]
+fn ack_when_pacer_blocks_stream_data() {
+    ack_when_send_blocked(true, false);
+}
+
+#[test]
+fn ack_when_congestion_window_blocks_padded_stream_data() {
+    ack_when_send_blocked(false, true);
+}
+
+#[test]
+fn ack_when_pacer_blocks_padded_stream_data() {
+    ack_when_send_blocked(true, true);
+}
+
 #[test]
 fn out_of_order_ack_eliciting_packet_triggers_ack() {
     let _guard = subscribe();
