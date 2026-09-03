@@ -55,11 +55,6 @@ impl CopyBuffer {
         R: AsyncStream + ?Sized,
         W: AsyncStream + ?Sized,
     {
-        // Check tokio's cooperative budget at the start of each poll.
-        // This ensures we yield to the runtime periodically during heavy I/O,
-        // allowing other tasks (like QUIC keepalives) to run.
-        let coop = ready!(tokio::task::coop::poll_proceed(cx));
-
         loop {
             let mut read_pending = false;
             let mut write_pending = false;
@@ -70,6 +65,10 @@ impl CopyBuffer {
             // packetize/write to the stream on poll_flush - and this also ends up being
             // beneficial since we are calling poll_flush each external loop iteration.
             while !self.read_done && self.cache_length < self.size {
+                // Charge each I/O operation, including partially ready buffered
+                // streams. One guard around the whole loop only spends one unit
+                // and cannot prevent a hot relay from monopolizing its worker.
+                let coop = ready!(tokio::task::coop::poll_proceed(cx));
                 let unused_start_index = (self.start_index + self.cache_length) % self.size;
                 let unused_end_index_exclusive = if unused_start_index < self.start_index {
                     self.start_index
@@ -83,12 +82,12 @@ impl CopyBuffer {
                 match reader.as_mut().poll_read(cx, &mut buf) {
                     Poll::Ready(val) => {
                         val?;
+                        coop.made_progress();
                         let n = buf.filled().len();
                         if n == 0 {
                             self.read_done = true;
                         } else {
                             self.cache_length += n;
-                            coop.made_progress();
                         }
                     }
                     Poll::Pending => {
@@ -101,13 +100,14 @@ impl CopyBuffer {
             if self.need_write_ping {
                 // if we just read data and we are going to write anyway, no need for a ping
                 if self.cache_length == 0 {
+                    let coop = ready!(tokio::task::coop::poll_proceed(cx));
                     match writer.as_mut().poll_write_ping(cx) {
                         Poll::Ready(val) => {
                             let written = val?;
+                            coop.made_progress();
                             self.need_write_ping = false;
                             if written {
                                 self.need_flush = true;
-                                coop.made_progress();
                             }
                         }
                         Poll::Pending => {
@@ -124,6 +124,7 @@ impl CopyBuffer {
             // latency, and so that we increase the chance we have an optimal read
             // with start_index at zero.
             while self.cache_length > 0 {
+                let coop = ready!(tokio::task::coop::poll_proceed(cx));
                 let used_start_index = self.start_index;
                 let used_end_index_exclusive =
                     std::cmp::min(self.start_index + self.cache_length, self.size);
@@ -159,6 +160,7 @@ impl CopyBuffer {
             }
 
             if self.need_flush {
+                let coop = ready!(tokio::task::coop::poll_proceed(cx));
                 ready!(writer.as_mut().poll_flush(cx))?;
                 self.need_flush = false;
                 coop.made_progress();
@@ -190,6 +192,7 @@ struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     b_buf: CopyBuffer,
     a_to_b: TransferState,
     b_to_a: TransferState,
+    poll_b_first: bool,
     sleep_future: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
@@ -237,6 +240,7 @@ where
             b_buf,
             a_to_b,
             b_to_a,
+            poll_b_first,
             sleep_future,
         } = &mut *self;
 
@@ -253,8 +257,19 @@ where
             }
         }
 
-        let a_to_b = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b);
-        let b_to_a = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
+        // Both directions share the task's cooperative budget. Rotate which one
+        // polls first so a continuously ready upload cannot spend every turn's
+        // budget before the reverse stream gets a chance to run.
+        let (a_to_b, b_to_a) = if *poll_b_first {
+            let b_result = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
+            let a_result = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b);
+            (a_result, b_result)
+        } else {
+            let a_result = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b);
+            let b_result = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
+            (a_result, b_result)
+        };
+        *poll_b_first = !*poll_b_first;
 
         match (a_to_b, b_to_a) {
             (Poll::Ready(Err(e)), _) | (_, Poll::Ready(Err(e))) => Poll::Ready(Err(e)),
@@ -312,6 +327,157 @@ where
     .await
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_stream::AsyncPing;
+    use std::future::poll_fn;
+    use tokio::io::{AsyncRead, AsyncWrite};
+
+    // Buffered wrappers and Quinn can return Ready without spending Tokio's I/O
+    // budget. The forwarding loop must also cooperate on those paths.
+    struct ReadyStream {
+        input: Vec<u8>,
+        offset: usize,
+        output: Vec<u8>,
+        read_chunk: usize,
+        write_chunk: usize,
+    }
+
+    impl ReadyStream {
+        fn new(input: Vec<u8>, read_chunk: usize, write_chunk: usize) -> Self {
+            Self {
+                input,
+                offset: 0,
+                output: Vec::new(),
+                read_chunk,
+                write_chunk,
+            }
+        }
+    }
+
+    impl AsyncRead for ReadyStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let n = buf
+                .remaining()
+                .min(self.read_chunk)
+                .min(self.input.len() - self.offset);
+            buf.put_slice(&self.input[self.offset..self.offset + n]);
+            self.offset += n;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for ReadyStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let n = buf.len().min(self.write_chunk);
+            self.output.extend_from_slice(&buf[..n]);
+            Poll::Ready(Ok(n))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for ReadyStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+    impl AsyncStream for ReadyStream {}
+
+    async fn check_yield_and_resume(read_chunk: usize, write_chunk: usize, buffer_size: usize) {
+        let expected: Vec<u8> = (0..65536).map(|n| (n % 251) as u8).collect();
+        let mut reader = ReadyStream::new(expected.clone(), read_chunk, usize::MAX);
+        let mut writer = ReadyStream::new(Vec::new(), usize::MAX, write_chunk);
+        let mut buffer = CopyBuffer::new(buffer_size, false);
+        let yielded = poll_fn(|cx| {
+            Poll::Ready(
+                buffer
+                    .poll_copy(cx, Pin::new(&mut reader), Pin::new(&mut writer))
+                    .is_pending(),
+            )
+        })
+        .await;
+        assert!(
+            yielded,
+            "hot buffered I/O must return to the scheduler before EOF"
+        );
+        assert!(writer.output.len() < expected.len());
+        poll_fn(|cx| buffer.poll_copy(cx, Pin::new(&mut reader), Pin::new(&mut writer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            writer.output, expected,
+            "yielding must preserve all buffered bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn hot_copy_cooperates_between_batches() {
+        check_yield_and_resume(256, 256, 256).await;
+    }
+
+    #[tokio::test]
+    async fn hot_copy_cooperates_during_partial_reads() {
+        check_yield_and_resume(1, usize::MAX, 16384).await;
+    }
+
+    #[tokio::test]
+    async fn hot_copy_cooperates_during_partial_writes() {
+        check_yield_and_resume(usize::MAX, 1, 16384).await;
+    }
+
+    #[tokio::test]
+    async fn hot_upload_does_not_starve_the_reverse_direction() {
+        let upload = vec![b'u'; 1024 * 1024];
+        let reply = b"reverse response".to_vec();
+        let mut client = ReadyStream::new(upload.clone(), 1, usize::MAX);
+        let mut destination = ReadyStream::new(reply.clone(), usize::MAX, usize::MAX);
+        let mut copy = CopyBidirectional {
+            a: &mut client,
+            b: &mut destination,
+            a_buf: CopyBuffer::new(16384, false),
+            b_buf: CopyBuffer::new(16384, false),
+            a_to_b: TransferState::Running,
+            b_to_a: TransferState::Running,
+            poll_b_first: false,
+            sleep_future: None,
+        };
+        // Give the relay fresh scheduler turns. A permanently preferred hot
+        // direction would spend every turn's shared budget before the reply.
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+            poll_fn(|cx| {
+                let _ = Pin::new(&mut copy).poll(cx);
+                Poll::Ready(())
+            })
+            .await;
+        }
+        assert_eq!(copy.a.output, reply);
+        assert!(
+            copy.b.output.len() < upload.len(),
+            "the reply must be forwarded during the upload"
+        );
+        copy.await.unwrap();
+        assert_eq!(destination.output, upload);
+    }
+}
+
 /// Copies data in both directions between `a` and `b` using buffers of the specified size.
 ///
 /// This method is the same as the [`copy_bidirectional()`], except that it allows you to set the
@@ -346,6 +512,7 @@ where
         b_buf: CopyBuffer::new(b_to_a_buf_size, a_need_initial_flush),
         a_to_b: TransferState::Running,
         b_to_a: TransferState::Running,
+        poll_b_first: false,
         sleep_future,
     }
     .await

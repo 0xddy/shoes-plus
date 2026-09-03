@@ -46,9 +46,8 @@ impl Datagrams<'_> {
                     .pop_front()
                     .expect("datagrams.outgoing.payload_bytes desynchronized");
                 trace!(len = prev.data.len(), "dropping outgoing datagram");
-                self.conn.datagrams.outgoing.payload_bytes -= prev.data.len();
             }
-        } else if self.conn.datagrams.outgoing.payload_bytes + data.len() + size_of::<Datagram>()
+        } else if self.conn.datagrams.outgoing.memory_used() + data.len() + size_of::<Datagram>()
             > self.conn.config.datagram_send_buffer_size
         {
             self.conn.datagrams.send_blocked = true;
@@ -96,7 +95,7 @@ impl Datagrams<'_> {
         self.conn
             .config
             .datagram_send_buffer_size
-            .saturating_sub(self.conn.datagrams.outgoing.payload_bytes)
+            .saturating_sub(self.conn.datagrams.outgoing.memory_used())
             .saturating_sub(size_of::<Datagram>())
     }
 }
@@ -135,7 +134,12 @@ impl DatagramState {
             self.recv();
         }
 
-        self.incoming.push_back(datagram);
+        // The decoded frame is a slice of a UDP/GRO packet. Retaining that slice
+        // would charge only its payload while keeping the whole packet allocated.
+        // Own exactly the queued payload so the byte budget reflects retained data.
+        self.incoming.push_back(Datagram {
+            data: Bytes::copy_from_slice(&datagram.data),
+        });
         Ok(was_empty)
     }
 
@@ -241,4 +245,143 @@ pub enum SendDatagramError {
     /// Send would block
     #[error("datagram send blocked")]
     Blocked(Bytes),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct PacketAllocation {
+        bytes: Vec<u8>,
+        retained_bytes: Arc<AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for PacketAllocation {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for PacketAllocation {
+        fn drop(&mut self) {
+            self.retained_bytes
+                .fetch_sub(self.bytes.len(), Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn received_datagrams_release_packet_backing_allocations() {
+        // A frame is a Bytes slice of the decrypted UDP packet. Padding and GRO
+        // can make its backing allocation much larger than the application data.
+        for packet_bytes in [1472, 1472 * 64] {
+            let retained = Arc::new(AtomicUsize::new(0));
+            let mut state = DatagramState::default();
+            let window = Some(8 * (1 + size_of::<Datagram>()));
+            for value in 0..32_u8 {
+                let mut bytes = vec![0; packet_bytes];
+                bytes[100] = value;
+                retained.fetch_add(packet_bytes, Ordering::Relaxed);
+                let packet = Bytes::from_owner(PacketAllocation {
+                    bytes,
+                    retained_bytes: Arc::clone(&retained),
+                });
+                state
+                    .received(
+                        Datagram {
+                            data: packet.slice(100..101),
+                        },
+                        &window,
+                    )
+                    .unwrap();
+                drop(packet);
+                assert_eq!(
+                    retained.load(Ordering::Relaxed),
+                    0,
+                    "a queued tiny datagram must not retain its whole UDP/GRO packet"
+                );
+                assert!(state.incoming.memory_used() <= window.unwrap());
+            }
+            // Preserve oldest-first eviction and byte-exact application data.
+            for value in 24..32_u8 {
+                assert_eq!(state.recv().unwrap().as_ref(), &[value]);
+            }
+            assert!(state.recv().is_none());
+            assert_eq!(state.incoming.memory_used(), 0);
+        }
+    }
+
+    #[test]
+    fn empty_received_datagrams_still_consume_metadata_budget() {
+        let mut state = DatagramState::default();
+        let window = Some(4 * size_of::<Datagram>());
+        for _ in 0..100 {
+            state
+                .received(Datagram { data: Bytes::new() }, &window)
+                .unwrap();
+            assert!(state.incoming.memory_used() <= window.unwrap());
+        }
+        assert_eq!(state.incoming.queue.len(), 4);
+    }
+
+    fn connection_with_send_window(window: usize) -> Connection {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let mut config = crate::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        Arc::get_mut(&mut config.transport)
+            .unwrap()
+            .datagram_send_buffer_size(window);
+        let mut endpoint = crate::Endpoint::new(Default::default(), None, true, None);
+        let (_, mut connection) = endpoint
+            .connect(
+                crate::Instant::now(),
+                config,
+                "127.0.0.1:443".parse().unwrap(),
+                "localhost",
+            )
+            .unwrap();
+        connection.peer_params.max_datagram_frame_size = Some(65535u32.into());
+        connection
+    }
+
+    #[test]
+    fn outgoing_drop_preserves_payload_accounting() {
+        let window = 2 * (16 + size_of::<Datagram>());
+        let mut connection = connection_with_send_window(window);
+
+        // Do not drain the network: a stalled peer repeatedly forces eviction.
+        for value in 0..100_u8 {
+            connection
+                .datagrams()
+                .send(Bytes::from(vec![value; 16]), true)
+                .unwrap();
+            let outgoing = &connection.datagrams.outgoing;
+            let actual: usize = outgoing.queue.iter().map(|item| item.data.len()).sum();
+            assert_eq!(outgoing.payload_bytes, actual, "after send {value}");
+            // Existing send(drop=true) semantics admit one final datagram beyond
+            // the configured budget, then evict on the next send.
+            assert!(outgoing.memory_used() <= window + 16 + size_of::<Datagram>());
+        }
+        while let Some(datagram) = connection.datagrams.outgoing.pop_front() {
+            assert_eq!(datagram.data.len(), 16);
+        }
+        assert_eq!(connection.datagrams.outgoing.memory_used(), 0);
+    }
+
+    #[test]
+    fn waiting_sends_include_all_queued_metadata_in_the_budget() {
+        let mut connection = connection_with_send_window(2 * size_of::<Datagram>());
+        connection.datagrams().send(Bytes::new(), false).unwrap();
+        connection.datagrams().send(Bytes::new(), false).unwrap();
+        assert_eq!(connection.datagrams().send_buffer_space(), 0);
+        assert!(matches!(
+            connection.datagrams().send(Bytes::new(), false),
+            Err(SendDatagramError::Blocked(_))
+        ));
+        assert_eq!(connection.datagrams.outgoing.queue.len(), 2);
+    }
 }

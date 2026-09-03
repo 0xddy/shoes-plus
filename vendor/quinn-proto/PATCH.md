@@ -32,3 +32,31 @@ Remove this vendor override when a compatible published Quinn release includes
 PR #2814 (or an equivalent fix), then run the assembler and HY2 upload
 regressions against that release. Do not remove the resource limits or downgrade
 to an older release without the 0.11.17 security fixes.
+
+## DATAGRAM storage accounting
+
+The resource-control audit also corrects three local 0.11.17 accounting defects:
+
+- Removing an outgoing datagram already subtracts its payload in `pop_front`;
+  the drop-to-make-space path must not subtract it a second time.
+- Blocking sends and `send_buffer_space` must count metadata for every queued
+  datagram, including empty payloads, rather than just one metadata entry.
+- Received frame slices are copied into payload-sized storage before queueing.
+  Otherwise a tiny frame could retain the complete decrypted UDP/GRO allocation
+  while the receive budget only counted its visible payload length.
+
+This retains oldest-first eviction and the 0.11.17 dropping-send allowance of
+one final datagram beyond the configured send window. The receive byte budget
+covers owned payload plus occupied entry metadata, not allocator overhead or
+spare `VecDeque` capacity. Copying received payloads adds a bounded copy per
+DATAGRAM; it does not copy STREAM traffic. Application-level HY2 fragment and
+forwarding queues have their own ownership/accounting boundaries.
+
+Run the private-module regressions with:
+
+```sh
+cargo test --manifest-path vendor/quinn-proto/Cargo.toml --locked --lib connection::datagrams::tests
+```
+
+The standalone lockfile is committed solely to make these vendor unit tests
+reproducible. Production builds continue to use their workspace root lockfile.
