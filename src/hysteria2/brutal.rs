@@ -502,18 +502,23 @@ mod tests {
             accept(None, AdvertisedReceive::Auto),
         );
         assert_eq!(
-            negotiate_server(0, 100, 200, false)
-                .header_value_for_test(),
+            negotiate_server(0, 100, 200, false).header_value_for_test(),
             "auto",
         );
-        assert_eq!(negotiate_server(0, 0, 0, false), accept(None, AdvertisedReceive::Auto));
+        assert_eq!(
+            negotiate_server(0, 0, 0, false),
+            accept(None, AdvertisedReceive::Auto)
+        );
 
         // Brutal branch: a declared client rate, capped by `up_mbps` only when one
         // is configured, while the opposite direction is advertised numerically and
         // independently -- numeric zero included.
         assert_eq!(
             negotiate_server(8_000_000, 0, 37, false),
-            accept(Some(8_000_000), AdvertisedReceive::BytesPerSecond(4_625_000)),
+            accept(
+                Some(8_000_000),
+                AdvertisedReceive::BytesPerSecond(4_625_000)
+            ),
             "an absent server upload cap leaves the client's rate intact",
         );
         assert_eq!(
@@ -522,8 +527,7 @@ mod tests {
             "the upload cap and numeric zero in the opposite direction are independent",
         );
         assert_eq!(
-            negotiate_server(8_000_000, 100, 200, false)
-                .header_value_for_test(),
+            negotiate_server(8_000_000, 100, 200, false).header_value_for_test(),
             "25000000",
         );
 
@@ -536,7 +540,10 @@ mod tests {
         // ...but with one configured, a declared rate still selects Brutal...
         assert_eq!(
             negotiate_server(8_000_000, 100, 200, true),
-            accept(Some(8_000_000), AdvertisedReceive::BytesPerSecond(25_000_000)),
+            accept(
+                Some(8_000_000),
+                AdvertisedReceive::BytesPerSecond(25_000_000)
+            ),
         );
         // ...and a client that declares nothing is refused, by masquerade.
         assert_eq!(

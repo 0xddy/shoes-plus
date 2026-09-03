@@ -539,6 +539,36 @@ async fn process_connection(
         result = async { tokio::try_join!(udp_loop, uni_loop, tcp_loop) } => result,
     };
 
+    // A transport failure ends every proxied stream on this connection. Keep one
+    // diagnostic at warning level: release builds compile out the per-loop debug
+    // messages, otherwise an INTERNAL_ERROR looks like a healthy but frozen node.
+    let close_reason = connection.close_reason();
+    let abnormal_close = match &close_reason {
+        None | Some(quinn::ConnectionError::LocallyClosed) => false,
+        Some(quinn::ConnectionError::ApplicationClosed(close)) => {
+            close.error_code != 0u32.into() && close.error_code != CLOSE_ERR_CODE_OK.into()
+        }
+        Some(quinn::ConnectionError::ConnectionClosed(close)) => {
+            close.error_code != quinn::TransportErrorCode::NO_ERROR
+        }
+        Some(_) => true,
+    };
+    if abnormal_close {
+        let stats = connection.stats();
+        warn!(
+            "Hysteria2 authenticated connection ended abnormally: peer={}, reason={close_reason:?}, rx_bytes={}, tx_bytes={}, rtt={:?}, cwnd={}, sent_packets={}, lost_packets={}, peer_data_blocked={}, peer_stream_data_blocked={}",
+            connection.remote_address(),
+            stats.udp_rx.bytes,
+            stats.udp_tx.bytes,
+            stats.path.rtt,
+            stats.path.cwnd,
+            stats.path.sent_packets,
+            stats.path.lost_packets,
+            stats.frame_rx.data_blocked,
+            stats.frame_rx.stream_data_blocked,
+        );
+    }
+
     cancel_token.cancel();
 
     // Per sing-box reference (service.go:277-293), close connection on error
@@ -2109,8 +2139,7 @@ pub async fn start_hysteria2_server(
         Arc::get_mut(&mut server_config.transport)
             .unwrap()
             .max_concurrent_bidi_streams(
-                (MAX_ACTIVE_TCP_LOGICAL_FLOWS as u32 + ADVERTISED_BIDI_STREAM_HEADROOM)
-                    .into(),
+                (MAX_ACTIVE_TCP_LOGICAL_FLOWS as u32 + ADVERTISED_BIDI_STREAM_HEADROOM).into(),
             )
             // required for HTTP/3 QPACK updates
             .max_concurrent_uni_streams(1024_u32.into())
@@ -2121,14 +2150,10 @@ pub async fn start_hysteria2_server(
             // sing-box's value (`hysteria.DefaultStreamReceiveWindow`), with the 20 MiB
             // connection window above it in the same 5:2 ratio.
             //
-            // A caveat that does not exist on quic-go: quinn rejects a stream whose
-            // buffer it cannot compact below 1024 spans (`MAX_CHUNKS`) and reports that
-            // as a connection-level INTERNAL_ERROR, where quic-go's equivalent ceiling
-            // is 20_000 gaps (`MaxStreamFrameSorterGaps`). At this window that needs
-            // roughly 18% loss scattered across a full window to reach, so it is a
-            // known residual risk rather than a reason to run a smaller window than the
-            // reference: a smaller one costs every long-RTT stream its throughput, which
-            // is a certain loss traded against an unlikely one.
+            // The vendored quinn-proto backport coalesces contiguous receive chunks
+            // before enforcing its gap limit. Stock 0.11.17 can otherwise close the
+            // entire connection after roughly 2.4 MB of ordinary unread MTU-sized
+            // chunks, even with no packet loss. See vendor/quinn-proto/PATCH.md.
             .stream_receive_window((8u32 * 1024 * 1024).into())
             // MTU settings per official TUIC reference
             .initial_mtu(1200)

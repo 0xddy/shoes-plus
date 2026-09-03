@@ -106,6 +106,7 @@ webpki-roots = { version = "*" }
 x509-parser = { version = "*", default-features = false, features = ["verify-aws"] }
 
 [dev-dependencies]
+assert_matches = "1.5"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
 # `test-util` gives tests a pausable clock. Rate-limit tests assert on elapsed
 # time, and against the real clock those are both slow and flaky.
@@ -113,6 +114,10 @@ tokio = { version = "*", features = ["test-util"] }
 rustls-pemfile = "*"
 tempfile = "*"
 tokio-rustls = "*"
+
+[patch.crates-io]
+quinn = { path = "vendor/quinn" }
+quinn-proto = { path = "vendor/quinn-proto" }
 
 # jemalloc for better memory performance (not supported on Windows MSVC, iOS, or Android)
 [target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))'.dependencies]

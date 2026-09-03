@@ -3145,8 +3145,7 @@ pub async fn start_tuic_server(
         Arc::get_mut(&mut server_config.transport)
             .unwrap()
             .max_concurrent_bidi_streams(
-                (MAX_ACTIVE_TCP_LOGICAL_FLOWS as u32 + ADVERTISED_BIDI_STREAM_HEADROOM)
-                    .into(),
+                (MAX_ACTIVE_TCP_LOGICAL_FLOWS as u32 + ADVERTISED_BIDI_STREAM_HEADROOM).into(),
             )
             .max_concurrent_uni_streams(4096_u32.into())
             .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()))

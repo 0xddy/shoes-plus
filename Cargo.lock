@@ -120,6 +120,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "assert_matches"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b34d609dfbaf33d6889b2b7106d3ca345eacad44200913df5ba02bfd31d2ba9"
+
+[[package]]
 name = "async-channel"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1866,8 +1872,6 @@ dependencies = [
 [[package]]
 name = "quinn"
 version = "0.11.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c1a41e437b6bbd489372cd4971de128e85c855f56c57f283d20ff016cf7c0a8"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -1887,8 +1891,6 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.11.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04759210543be93709136e28212294a659ef5001836ff4eab4d663e4529bba83"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -2335,6 +2337,7 @@ version = "0.2.8"
 dependencies = [
  "android_logger",
  "arc-swap",
+ "assert_matches",
  "async-trait",
  "aws-lc-rs",
  "base64 0.23.1",
