@@ -45,6 +45,7 @@
 //! QUIC accept loops -- so they take a [`SelectorSlot`] instead, which reaches their
 //! routing rules by the same mechanism and nothing else.
 
+pub mod analysis;
 pub mod credential;
 mod meter;
 mod rate;

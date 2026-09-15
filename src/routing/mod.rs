@@ -9,5 +9,6 @@ pub mod predicate;
 pub(crate) mod protocol;
 pub mod srs;
 mod udp_router;
+pub(crate) mod udp_sniff;
 
 pub use udp_router::{ServerStream, run_udp_routing};

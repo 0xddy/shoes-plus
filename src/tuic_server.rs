@@ -1432,6 +1432,7 @@ async fn connect_udp_target(
                     warn!("TUIC UDP outbound setup to {outbound_location} failed: {error}");
                     error
                 })
+                .map(|stream| crate::dynamic::analysis::wrap_udp(stream, &requested_location))
         }
         ConnectDecision::Block => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -1669,17 +1670,20 @@ fn spawn_udp_target_worker(
     permit: UdpTargetPermit,
     session_target_permits: Arc<Semaphore>,
 ) {
-    tokio::spawn(run_udp_target_worker(
-        remote_location,
-        generation,
-        initial_remote,
-        outbound_rx,
-        event_tx,
-        client_proxy_selector,
-        resolver,
-        cancel_token,
-        permit,
-        session_target_permits,
+    tokio::spawn(crate::dynamic::analysis::scope_udp(
+        crate::dynamic::analysis::current_udp(),
+        run_udp_target_worker(
+            remote_location,
+            generation,
+            initial_remote,
+            outbound_rx,
+            event_tx,
+            client_proxy_selector,
+            resolver,
+            cancel_token,
+            permit,
+            session_target_permits,
+        ),
     ));
 }
 
@@ -2430,19 +2434,25 @@ fn activate_udp_session(
     let worker_map = udp_session_map.clone();
     let cleanup_map = udp_session_map.clone();
     let cleanup_fragments = fragments.clone();
+    let analysis = crate::dynamic::analysis::UdpAnalysis::for_user(
+        meter.as_ref().and_then(|meter| meter.user().cloned()),
+    );
     tokio::spawn(async move {
-        let result = run_udp_session_worker(
-            assoc_id,
-            generation,
-            worker_map,
-            response,
-            initial_location,
-            initial_permit,
-            outbound_rx,
-            session_selector,
-            session_resolver,
-            target_permits,
-            session_cancel_token,
+        let result = crate::dynamic::analysis::scope_udp(
+            Some(analysis),
+            run_udp_session_worker(
+                assoc_id,
+                generation,
+                worker_map,
+                response,
+                initial_location,
+                initial_permit,
+                outbound_rx,
+                session_selector,
+                session_resolver,
+                target_permits,
+                session_cancel_token,
+            ),
         )
         .await;
         remove_udp_generation(&cleanup_map, &cleanup_fragments, assoc_id, generation);

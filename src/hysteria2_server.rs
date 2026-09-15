@@ -1072,17 +1072,23 @@ impl UdpSession {
         };
 
         let remote_ip = connection.remote_address().ip();
+        let analysis = crate::dynamic::analysis::UdpAnalysis::for_user(
+            meter.as_ref().and_then(|meter| meter.user().cloned()),
+        );
         tokio::spawn(async move {
-            let result = run_udp_session_worker(
-                session_id,
-                connection,
-                outbound_rx,
-                client_proxy_selector,
-                resolver,
-                target_permits,
-                meter,
-                last_activity,
-                session_cancel_token,
+            let result = crate::dynamic::analysis::scope_udp(
+                Some(analysis),
+                run_udp_session_worker(
+                    session_id,
+                    connection,
+                    outbound_rx,
+                    client_proxy_selector,
+                    resolver,
+                    target_permits,
+                    meter,
+                    last_activity,
+                    session_cancel_token,
+                ),
             )
             .await;
 
@@ -1146,6 +1152,7 @@ async fn connect_udp_target(
                     warn!("Hysteria2 UDP outbound setup to {outbound_location} failed: {error}");
                     error
                 })
+                .map(|stream| crate::dynamic::analysis::wrap_udp(stream, &requested_location))
         }
         ConnectDecision::Block => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -1199,17 +1206,21 @@ fn spawn_udp_target_worker(
         "a new target queue has room for its initial packet"
     );
     let task_location = remote_location.clone();
+    let analysis = crate::dynamic::analysis::current_udp();
     tokio::spawn(async move {
-        if let Err(error) = run_udp_target_worker(
-            task_location.clone(),
-            generation,
-            permit,
-            session_target_permits,
-            outbound_rx,
-            client_proxy_selector,
-            resolver,
-            response_tx.clone(),
-            task_cancel_token,
+        if let Err(error) = crate::dynamic::analysis::scope_udp(
+            analysis,
+            run_udp_target_worker(
+                task_location.clone(),
+                generation,
+                permit,
+                session_target_permits,
+                outbound_rx,
+                client_proxy_selector,
+                resolver,
+                response_tx.clone(),
+                task_cancel_token,
+            ),
         )
         .await
         {
@@ -1900,17 +1911,42 @@ fn encode_tcp_response(ok: bool, message: &str) -> std::io::Result<Vec<u8>> {
     Ok(response)
 }
 
-async fn write_tcp_response<W>(stream: &mut W, ok: bool, message: &str) -> std::io::Result<()>
+#[derive(Debug, PartialEq, Eq)]
+enum TcpResponseWrite {
+    Sent,
+    PeerStopped,
+}
+
+async fn write_tcp_response<W>(
+    stream: &mut W,
+    ok: bool,
+    message: &str,
+) -> std::io::Result<TcpResponseWrite>
 where
     W: tokio::io::AsyncWrite + Unpin + ?Sized,
 {
     let response = encode_tcp_response(ok, message)?;
-    stream.write_all(&response).await.map_err(|error| {
-        std::io::Error::new(
+    match stream.write_all(&response).await {
+        Ok(()) => Ok(TcpResponseWrite::Sent),
+        Err(error)
+            if ok
+                && matches!(
+                    error
+                        .get_ref()
+                        .and_then(|cause| cause.downcast_ref::<quinn::WriteError>()),
+                    Some(quinn::WriteError::Stopped(_))
+                ) =>
+        {
+            // Upload-only clients may finish and cancel their unused response
+            // direction while the outbound dial is still pending. STOP_SENDING
+            // does not cancel the upload; RESET_STREAM would do that separately.
+            Ok(TcpResponseWrite::PeerStopped)
+        }
+        Err(error) => Err(std::io::Error::new(
             error.kind(),
             format!("Hysteria2 TCP response write failed: {error}"),
-        )
-    })
+        )),
+    }
 }
 
 async fn write_tcp_fast_open_replay<W>(stream: &mut W, replay: &[u8]) -> std::io::Result<()>
@@ -2019,8 +2055,14 @@ async fn process_tcp_stream(
 
     // Match sing-box: a successful TCP response reports that routing, DNS and the
     // outbound dial have all completed, not merely that the request parsed.
-    write_tcp_response(&mut server_stream, true, "").await?;
-    let mut client_stream = apply_client_early_data(&mut server_stream, client_setup).await?;
+    let response = write_tcp_response(&mut server_stream, true, "").await?;
+    let mut client_stream = if response == TcpResponseWrite::PeerStopped {
+        // The client no longer wants reverse traffic, including any bytes the
+        // outbound handshake already buffered. Retain the target for the upload.
+        client_setup.client_stream
+    } else {
+        apply_client_early_data(&mut server_stream, client_setup).await?
+    };
 
     let client_requires_flush = if replay.is_empty() {
         false
@@ -2029,17 +2071,35 @@ async fn process_tcp_stream(
         true
     };
 
-    // Use 32KB buffers to match hysteria2/sing-box reference implementations
-    let copy_result = copy_bidirectional_with_sizes(
-        &mut server_stream,
-        &mut client_stream,
-        // no need to flush even through we wrote this response since it's quic
-        false,
-        client_requires_flush,
-        32768,
-        32768,
-    )
-    .await;
+    let copy_result = if response == TcpResponseWrite::PeerStopped {
+        // Discard reverse traffic after cancellation, but keep reading it: a
+        // target may write before reading the upload, and dropping a TCP socket
+        // with unread data can reset it while upload bytes are still in flight.
+        let (mut target_read, mut target_write) = tokio::io::split(&mut client_stream);
+        let upload = async {
+            if client_requires_flush {
+                target_write.flush().await?;
+            }
+            tokio::io::copy(&mut server_stream, &mut target_write).await?;
+            // The target needs FIN to finish the file and close its reply side.
+            target_write.shutdown().await
+        };
+        let mut discarded = tokio::io::sink();
+        let drain = tokio::io::copy(&mut target_read, &mut discarded);
+        tokio::try_join!(upload, drain).map(|_| ())
+    } else {
+        // Use 32KB buffers to match hysteria2/sing-box reference implementations
+        copy_bidirectional_with_sizes(
+            &mut server_stream,
+            &mut client_stream,
+            // no need to flush even though we wrote this response since it's QUIC
+            false,
+            client_requires_flush,
+            32768,
+            32768,
+        )
+        .await
+    };
 
     let (_, _) = futures::join!(server_stream.shutdown(), client_stream.shutdown());
 
@@ -2293,11 +2353,11 @@ mod tests {
     use super::{
         MAX_ACTIVE_TCP_LOGICAL_FLOWS, MAX_FRAGMENT_CACHE_SIZE, MAX_TCP_RESPONSE_MESSAGE_LENGTH,
         MAX_UDP_FRAGMENT_BYTES_PER_CONNECTION, MAX_UDP_PACKET_SIZE, MAX_UDP_TARGETS_PER_SESSION,
-        TCP_REQUEST_HEADER_TIMEOUT, UdpForwardCommand, UdpFragmentCache, UdpResponseSendOutcome,
-        UdpSession, UdpTargetEvent, UdpTargetPermit, UdpTargetWorker, acquire_udp_target_permits,
-        checked_response_fragment_count, checked_udp_packet_len, cleanup_udp_sessions,
-        connect_udp_target, decode_udp_address_length, dispatch_udp_target_command,
-        encode_tcp_response, read_tcp_request_header_before_deadline,
+        TCP_REQUEST_HEADER_TIMEOUT, TcpResponseWrite, UdpForwardCommand, UdpFragmentCache,
+        UdpResponseSendOutcome, UdpSession, UdpTargetEvent, UdpTargetPermit, UdpTargetWorker,
+        acquire_udp_target_permits, checked_response_fragment_count, checked_udp_packet_len,
+        cleanup_udp_sessions, connect_udp_target, decode_udp_address_length,
+        dispatch_udp_target_command, encode_tcp_response, read_tcp_request_header_before_deadline,
         run_connected_udp_target_worker, send_udp_response_with, try_admit_tcp_logical_flow,
         try_reserve_payload_bytes, try_reserve_udp_target_worker, udp_response_send_allowed,
         valid_udp_fragment, write_tcp_fast_open_replay, write_tcp_response,
@@ -3265,6 +3325,62 @@ mod tests {
 
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
+        }
+    }
+
+    struct FailedQuicWriter(quinn::WriteError);
+
+    impl AsyncWrite for FailedQuicWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(self.0.clone().into()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_success_response_allows_a_cancelled_read_direction() {
+        // STOP_SENDING cancels only the response direction, regardless of its
+        // application error code. The peer can still be finishing an upload.
+        for code in [0u32, 42] {
+            let stopped = quinn::WriteError::Stopped(code.into());
+            let response = write_tcp_response(&mut FailedQuicWriter(stopped.clone()), true, "")
+                .await
+                .expect("an unread success response must not abandon an upload");
+            assert_eq!(response, TcpResponseWrite::PeerStopped);
+            write_tcp_response(&mut FailedQuicWriter(stopped), false, "DNS failed")
+                .await
+                .expect_err("a rejection must still report a failed response write");
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_success_response_preserves_other_transport_errors() {
+        for error in [
+            quinn::WriteError::ConnectionLost(quinn::ConnectionError::TimedOut),
+            quinn::WriteError::ClosedStream,
+            quinn::WriteError::ZeroRttRejected,
+        ] {
+            let expected_kind = std::io::Error::from(error.clone()).kind();
+            let failure = write_tcp_response(&mut FailedQuicWriter(error), true, "")
+                .await
+                .expect_err("connection failures must still terminate setup");
+            assert_eq!(failure.kind(), expected_kind);
+            assert!(
+                failure
+                    .to_string()
+                    .contains("Hysteria2 TCP response write failed")
+            );
         }
     }
 

@@ -472,7 +472,8 @@ where
 
                     run_udp_copy(
                         server_stream,
-                        client_stream,
+                        crate::dynamic::analysis::UdpAnalysis::new()
+                            .wrap(client_stream, &requested_location),
                         server_need_initial_flush,
                         false,
                     )
@@ -648,6 +649,7 @@ pub(crate) async fn prepare_client_tcp_stream_with_metadata(
     metadata: Option<SniffedTcpMetadata>,
 ) -> std::io::Result<Option<TcpClientSetupResult>> {
     let requested_location = remote_location.clone();
+    let analysis_metadata = metadata.clone();
     let action_result = match metadata {
         Some(metadata) => {
             client_proxy_selector
@@ -680,13 +682,19 @@ pub(crate) async fn prepare_client_tcp_stream_with_metadata(
             remote_location,
         } => {
             let outbound_location = remote_location.clone();
-            let setup = chain_group
+            let mut setup = chain_group
                 .connect_tcp(remote_location, &resolver)
                 .await
                 .map_err(|error| {
                     warn!("TCP outbound setup to {outbound_location} failed: {error}");
                     error
                 })?;
+            setup.client_stream = crate::dynamic::analysis::wrap_tcp(
+                setup.client_stream,
+                &requested_location,
+                analysis_metadata.as_ref(),
+                setup.early_data.as_ref().map_or(0, |data| data.len()),
+            );
             Ok(Some(setup))
         }
         ConnectDecision::Block => Ok(None),

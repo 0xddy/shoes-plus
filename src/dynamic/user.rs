@@ -87,6 +87,7 @@ pub struct UserContext {
     tx_limiter: RateLimiter,
     /// Bandwidth ceiling for bytes coming from the client -- their *upload*.
     rx_limiter: RateLimiter,
+    analysis: std::sync::OnceLock<Arc<super::analysis::AnalysisUserContext>>,
 }
 
 impl std::fmt::Debug for UserContext {
@@ -137,6 +138,7 @@ impl UserContext {
             no_connections: Notify::new(),
             tx_limiter: RateLimiter::new(),
             rx_limiter: RateLimiter::new(),
+            analysis: std::sync::OnceLock::new(),
         })
     }
 
@@ -266,6 +268,14 @@ impl UserContext {
         max_bytes: u64,
     ) -> Poll<RatePermit<'a>> {
         self.tx_limiter.poll_acquire(waiter, cx, max_bytes)
+    }
+
+    pub fn set_analysis_context(&self, context: Arc<super::analysis::AnalysisUserContext>) {
+        let _ = self.analysis.set(context);
+    }
+
+    pub(crate) fn analysis_context(&self) -> Option<&Arc<super::analysis::AnalysisUserContext>> {
+        self.analysis.get()
     }
 
     /// Poll for upload allowance. See [`poll_acquire_tx`](Self::poll_acquire_tx).

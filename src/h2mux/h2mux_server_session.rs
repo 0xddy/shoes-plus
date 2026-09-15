@@ -445,14 +445,7 @@ where
         tokio::spawn(async move {
             let work = handle_h2mux_stream(inbound, udp_enabled, proxy_selector, resolver);
             let result = if let Some(meter) = removal_meter {
-                tokio::select! {
-                    biased;
-                    () = meter.cancelled() => Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "user removed",
-                    )),
-                    result = work => result,
-                }
+                crate::dynamic::scope_connection_until_cancelled(meter, work).await
             } else {
                 work.await
             };
@@ -526,6 +519,7 @@ async fn handle_h2mux_tcp(
     // the same sniff/replay contract as a direct inbound so `protocol`, TLS SNI
     // and HTTP Host rules cannot be bypassed merely by enabling multiplexing.
     let (sniffed, replay) = sniff_h2mux_tcp(&mut stream, &proxy_selector).await?;
+    let analysis_metadata = sniffed.clone();
     let action = match sniffed {
         Some(metadata) => proxy_selector
             .judge_sniffed_tcp(
@@ -571,7 +565,14 @@ async fn handle_h2mux_tcp(
             // relay starts; writing through H2MuxServerStream also emits the mux
             // success status, so a server-first protocol cannot leave the client
             // waiting forever after its banner was consumed as early data.
+            let initial_download = early_data.as_ref().map_or(0, |data| data.len());
             forward_client_early_data(&mut stream, early_data).await?;
+            client_stream = crate::dynamic::analysis::wrap_tcp(
+                client_stream,
+                &destination,
+                analysis_metadata.as_ref(),
+                initial_download,
+            );
 
             let client_requires_flush = if replay.is_empty() {
                 false
@@ -669,6 +670,8 @@ async fn handle_h2mux_udp(
             // Wrap in VlessMessageStream for length-prefixed packets
             let server_stream = VlessMessageStream::new(Box::new(stream));
 
+            let client_stream =
+                crate::dynamic::analysis::UdpAnalysis::new().wrap(client_stream, &destination);
             run_udp_copy(Box::new(server_stream), client_stream, false, false).await
         }
         ConnectDecision::Block => {

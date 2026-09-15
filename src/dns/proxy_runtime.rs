@@ -658,8 +658,10 @@ mod tests {
     use crate::async_stream::{
         AsyncFlushMessage, AsyncPing, AsyncReadMessage, AsyncShutdownMessage, AsyncWriteMessage,
     };
+    use crate::config::{ClientChainHop, ClientConfig, ClientProxyConfig, ConfigSelection};
+    use crate::option_util::OneOrSome;
     use crate::resolver::NativeResolver;
-    use crate::tcp::chain_builder::build_direct_chain_group;
+    use crate::tcp::chain_builder::{build_client_proxy_chain, build_direct_chain_group};
     use crate::vless::VlessMessageStream;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1044,16 +1046,40 @@ mod tests {
         assert!(outbound_rx.try_recv().is_err());
     }
 
+    async fn stalled_proxy_provider(
+        timeout: Duration,
+    ) -> (ProxyRuntimeProvider, tokio::net::TcpListener) {
+        // The kernel completes a local TCP connection, but this listener never
+        // answers the SOCKS handshake. Keep it alive until the provider times
+        // out, avoiding assumptions about routing to a "black hole" address.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let resolver = Arc::new(NativeResolver::new());
+        let chain = build_client_proxy_chain(
+            OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
+                ClientConfig {
+                    address: NetLocation::from_ip_addr(address.ip(), address.port()),
+                    protocol: ClientProxyConfig::Socks {
+                        username: None,
+                        password: None,
+                    },
+                    ..Default::default()
+                },
+            ))),
+            resolver.clone(),
+        );
+        let provider = ProxyRuntimeProvider::with_bootstrap(
+            Arc::new(ClientChainGroup::new(vec![chain])),
+            resolver,
+            timeout,
+        );
+        (provider, listener)
+    }
+
     #[tokio::test]
     async fn test_connect_tcp_respects_timeout() {
-        let resolver = Arc::new(NativeResolver::new());
-        let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
-        let provider =
-            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, DEFAULT_CONNECT_TIMEOUT);
-
-        // Use an address that will hang (black hole) rather than refuse immediately.
-        // 10.255.255.1 is a non-routable address that should cause the connection to hang.
-        let server_addr: SocketAddr = "10.255.255.1:53".parse().unwrap();
+        let (provider, _listener) = stalled_proxy_provider(DEFAULT_CONNECT_TIMEOUT).await;
+        let server_addr: SocketAddr = "192.0.2.53:53".parse().unwrap();
 
         let start = std::time::Instant::now();
         let result = provider
@@ -1081,12 +1107,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_tcp_caps_passed_timeout_by_configured_connect_timeout() {
-        let resolver = Arc::new(NativeResolver::new());
-        let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
-        let provider =
-            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, Duration::from_millis(100));
-
-        let server_addr: SocketAddr = "10.255.255.1:53".parse().unwrap();
+        let (provider, _listener) = stalled_proxy_provider(Duration::from_millis(100)).await;
+        let server_addr: SocketAddr = "192.0.2.53:53".parse().unwrap();
 
         let start = std::time::Instant::now();
         let result = provider
@@ -1108,13 +1130,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_tcp_uses_default_timeout_when_none() {
-        let resolver = Arc::new(NativeResolver::new());
-        let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
-        let provider =
-            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, DEFAULT_CONNECT_TIMEOUT);
-
-        // Use a black hole address
-        let server_addr: SocketAddr = "10.255.255.1:53".parse().unwrap();
+        let (provider, _listener) = stalled_proxy_provider(DEFAULT_CONNECT_TIMEOUT).await;
+        let server_addr: SocketAddr = "192.0.2.53:53".parse().unwrap();
 
         let start = std::time::Instant::now();
         let result = provider.connect_tcp(server_addr, None, None).await;

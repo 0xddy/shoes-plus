@@ -460,6 +460,8 @@ struct PendingSessionCreate {
 
 /// The unified UDP router
 pub struct UdpRouter<'a> {
+    analysis: Arc<crate::dynamic::analysis::UdpAnalysis>,
+    session_analysis: FxHashMap<u16, Arc<crate::dynamic::analysis::UdpAnalysis>>,
     server: &'a mut ServerStream,
     /// Lookup: maps flow key -> session state
     session_lookup: SessionLookup,
@@ -521,6 +523,8 @@ impl<'a> UdpRouter<'a> {
 
         Self {
             server,
+            analysis: crate::dynamic::analysis::UdpAnalysis::new(),
+            session_analysis: FxHashMap::default(),
             session_lookup,
             sessions: IndexMap::with_hasher(FxBuildHasher),
             next_session_id: 0,
@@ -1311,6 +1315,7 @@ impl<'a> UdpRouter<'a> {
                         SessionLookup::ByDestination(_) => false,
                     };
                     if !has_other_subflow {
+                        self.session_analysis.remove(&session_id);
                         self.queue_session_end(session_id, true);
                     }
                 }
@@ -1352,6 +1357,15 @@ impl<'a> UdpRouter<'a> {
         let selector = Arc::clone(&self.selector);
         let resolver = Arc::clone(&self.resolver);
         let dest_for_future = destination;
+        let analysis = if matches!(lookup_key, LookupKey::ProtocolSession(_)) {
+            self.session_analysis
+                .entry(session_id)
+                .or_insert_with(crate::dynamic::analysis::UdpAnalysis::new)
+                .clone()
+        } else {
+            self.analysis.clone()
+        };
+        let analysis_destination = original_destination.clone();
 
         let future: SessionCreateFuture = Box::pin(async move {
             tokio::time::timeout(UDP_FLOW_CREATE_TIMEOUT, async move {
@@ -1369,7 +1383,7 @@ impl<'a> UdpRouter<'a> {
                             .await?;
 
                         Ok(SessionCreateResult {
-                            remote: connection.client_stream,
+                            remote: analysis.wrap(connection.client_stream, &analysis_destination),
                             resolved_addr: connection.remote_addr,
                         })
                     }
@@ -1399,6 +1413,7 @@ impl<'a> UdpRouter<'a> {
     /// One XUDP protocol session may own several destination subflows. End retires
     /// every active subflow and cancels every pending creation for that ID.
     fn end_protocol_session(&mut self, session_id: u16) {
+        self.session_analysis.remove(&session_id);
         let mut active_ids = Vec::new();
         let found_lookup = match &mut self.session_lookup {
             SessionLookup::ByProtocolSession(map) => {
@@ -1457,6 +1472,9 @@ impl<'a> UdpRouter<'a> {
             }
             (SessionLookup::ByProtocolSession(map), LookupKey::ProtocolSession(key)) => {
                 map.remove(&key);
+                if !map.keys().any(|other| other.session_id == key.session_id) {
+                    self.session_analysis.remove(&key.session_id);
+                }
             }
             _ => unreachable!(),
         }

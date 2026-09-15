@@ -468,11 +468,11 @@ async fn naive_service(
         };
 
         if let Some(meter) = removal_meter {
-            tokio::select! {
-                biased;
-                () = meter.cancelled() => {}
-                () = tunnel => {}
-            }
+            let _ = crate::dynamic::scope_connection_until_cancelled(meter, async {
+                tunnel.await;
+                Ok(())
+            })
+            .await;
         } else {
             tunnel.await;
         }
@@ -666,7 +666,8 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
 
                         return run_udp_copy(
                             Box::new(uot_v2_stream) as Box<dyn AsyncMessageStream>,
-                            client_stream,
+                            crate::dynamic::analysis::UdpAnalysis::new()
+                                .wrap(client_stream, &destination),
                             false,
                             false,
                         )
@@ -699,23 +700,29 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
         user_name, remote_location
     );
 
-    let action = proxy_selector
-        .judge_tcp(remote_location.clone().into(), &resolver)
-        .await?;
-
-    let mut client_stream: Box<dyn AsyncStream> = match action {
-        ConnectDecision::Allow {
-            chain_group,
-            remote_location,
-        } => {
-            let result = chain_group.connect_tcp(remote_location, &resolver).await?;
-            result.client_stream
-        }
-        ConnectDecision::Block => {
-            debug!("NaiveProxy: connection blocked by rules");
-            return Ok(());
-        }
+    let mut replay = Vec::new();
+    let sniffed = if proxy_selector.needs_tcp_sniff() {
+        crate::routing::protocol::sniff_tcp(&mut stream, &mut replay).await?
+    } else {
+        None
     };
+    let Some(setup) = crate::tcp::tcp_server::prepare_client_tcp_stream_with_metadata(
+        proxy_selector,
+        resolver,
+        remote_location,
+        sniffed,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let mut stream: Box<dyn AsyncStream> = Box::new(stream);
+    let mut client_stream =
+        crate::tcp::tcp_server::apply_client_early_data(&mut stream, setup).await?;
+    if !replay.is_empty() {
+        client_stream.write_all(&replay).await?;
+        client_stream.flush().await?;
+    }
 
     // Larger than the 16 KiB default, because a single CONNECT tunnel here carries a
     // whole client connection and the default costs syscalls on a fast link.

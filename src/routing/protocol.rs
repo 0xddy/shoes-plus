@@ -24,6 +24,9 @@ pub(crate) struct SniffedTcpMetadata {
     pub protocol: RouteProtocol,
     /// HTTP Host or TLS SNI.  Empty/missing values leave this as `None`.
     pub domain: Option<String>,
+    /// The visited name for analytics. ECH outer SNI remains usable for routing,
+    /// but cannot identify the encrypted destination (including GREASE ECH).
+    pub analysis_domain: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +165,7 @@ fn classify_http(bytes: &[u8]) -> TcpPrefixClassification {
         .and_then(|host| normalize_authority_host(&host));
     TcpPrefixClassification::Matched(SniffedTcpMetadata {
         protocol: RouteProtocol::Http,
+        analysis_domain: domain.clone(),
         domain,
     })
 }
@@ -204,10 +208,11 @@ fn classify_tls(bytes: &[u8]) -> TcpPrefixClassification {
                 return TcpPrefixClassification::NoMatch;
             }
             if handshake.len() >= hello_len + 4 {
-                let domain = parse_client_hello_sni(&handshake[4..hello_len + 4]);
+                let names = parse_client_hello_server_names(&handshake[4..hello_len + 4]);
                 return TcpPrefixClassification::Matched(SniffedTcpMetadata {
                     protocol: RouteProtocol::Tls,
-                    domain,
+                    domain: names.domain,
+                    analysis_domain: names.analysis_domain,
                 });
             }
         }
@@ -218,14 +223,32 @@ fn classify_tls(bytes: &[u8]) -> TcpPrefixClassification {
     }
 }
 
-fn parse_client_hello_sni(hello: &[u8]) -> Option<String> {
+#[derive(Default)]
+pub(crate) struct ClientHelloServerNames {
+    pub domain: Option<String>,
+    pub analysis_domain: Option<String>,
+}
+
+pub(crate) fn parse_client_hello_server_names(hello: &[u8]) -> ClientHelloServerNames {
+    let mut names = ClientHelloServerNames::default();
+    // Scan the entire extension block: ECH commonly follows server_name. A
+    // malformed trailing extension must not expose an unverified outer name,
+    // while the first SNI is retained for the existing routing behavior.
+    if client_hello_has_ech(hello, &mut names.domain) == Some(false) {
+        names.analysis_domain = names.domain.clone();
+    }
+    names
+}
+
+fn client_hello_has_ech(hello: &[u8], domain: &mut Option<String>) -> Option<bool> {
+    const ENCRYPTED_CLIENT_HELLO: usize = 0xfe0d;
     // legacy_version + random
     let mut offset = 34usize;
     offset = skip_u8_vector(hello, offset)?;
     offset = skip_u16_vector(hello, offset)?;
     offset = skip_u8_vector(hello, offset)?;
     if offset == hello.len() {
-        return None;
+        return Some(false);
     }
     let extensions_len = read_u16(hello, offset)?;
     offset += 2;
@@ -233,7 +256,12 @@ fn parse_client_hello_sni(hello: &[u8]) -> Option<String> {
     if extensions_end > hello.len() {
         return None;
     }
-    while offset + 4 <= extensions_end {
+    let mut has_ech = false;
+    let mut saw_server_name = false;
+    while offset < extensions_end {
+        if extensions_end - offset < 4 {
+            return None;
+        }
         let extension_type = read_u16(hello, offset)?;
         let extension_len = read_u16(hello, offset + 2)?;
         offset += 4;
@@ -241,30 +269,40 @@ fn parse_client_hello_sni(hello: &[u8]) -> Option<String> {
         if extension_end > extensions_end {
             return None;
         }
-        if extension_type == 0 {
-            let list_len = read_u16(hello, offset)?;
-            let mut name_offset = offset + 2;
-            let list_end = name_offset.checked_add(list_len)?;
-            if list_end > extension_end {
-                return None;
-            }
-            while name_offset + 3 <= list_end {
-                let name_type = hello[name_offset];
-                let name_len = read_u16(hello, name_offset + 1)?;
-                name_offset += 3;
-                let name_end = name_offset.checked_add(name_len)?;
-                if name_end > list_end {
-                    return None;
-                }
-                if name_type == 0 {
-                    let name = std::str::from_utf8(&hello[name_offset..name_end]).ok()?;
-                    return normalize_authority_host(name);
-                }
-                name_offset = name_end;
-            }
-            return None;
+        has_ech |= extension_type == ENCRYPTED_CLIENT_HELLO;
+        if extension_type == 0 && !saw_server_name {
+            // Retain the first SNI extension, as the routing parser did before
+            // analytics needed the rest of the extension list.
+            saw_server_name = true;
+            *domain = parse_server_name_extension(&hello[offset..extension_end]);
         }
         offset = extension_end;
+    }
+    // A ClientHello ends with the extension vector. Preserve routing SNI from
+    // the declared block, but do not trust it for analytics if bytes follow it.
+    (extensions_end == hello.len()).then_some(has_ech)
+}
+
+fn parse_server_name_extension(extension: &[u8]) -> Option<String> {
+    let list_len = read_u16(extension, 0)?;
+    let mut offset = 2usize;
+    let list_end = offset.checked_add(list_len)?;
+    if list_end > extension.len() {
+        return None;
+    }
+    while offset + 3 <= list_end {
+        let name_type = extension[offset];
+        let name_len = read_u16(extension, offset + 1)?;
+        offset += 3;
+        let name_end = offset.checked_add(name_len)?;
+        if name_end > list_end {
+            return None;
+        }
+        if name_type == 0 {
+            let name = std::str::from_utf8(&extension[offset..name_end]).ok()?;
+            return normalize_authority_host(name);
+        }
+        offset = name_end;
     }
     None
 }
@@ -303,6 +341,66 @@ fn normalize_authority_host(authority: &str) -> Option<String> {
     };
     let normalized = host.trim_end_matches('.').to_ascii_lowercase();
     (!normalized.is_empty()).then_some(normalized)
+}
+
+#[cfg(test)]
+pub(crate) mod test_vectors {
+    /// The same ClientHello is used by both TCP and encrypted QUIC tests.
+    pub(crate) fn tls_client_hello(
+        server_name: &str,
+        extra: &[(u16, &[u8])],
+        sni_first: bool,
+    ) -> Vec<u8> {
+        let name = server_name.as_bytes();
+        let mut sni = Vec::new();
+        sni.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
+        sni.push(0);
+        sni.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        sni.extend_from_slice(name);
+
+        let mut extensions = Vec::new();
+        let mut append = |kind: u16, body: &[u8]| {
+            extensions.extend_from_slice(&kind.to_be_bytes());
+            extensions.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            extensions.extend_from_slice(body);
+        };
+        if sni_first {
+            append(0, &sni);
+        }
+        for (kind, body) in extra {
+            append(*kind, body);
+        }
+        if !sni_first {
+            append(0, &sni);
+        }
+
+        let mut hello = vec![0x03, 0x03];
+        hello.extend_from_slice(&[0u8; 32]);
+        hello.extend_from_slice(&[0, 0, 2, 0x13, 0x01, 1, 0]);
+        hello.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        hello.extend_from_slice(&extensions);
+        let mut handshake = vec![
+            1,
+            ((hello.len() >> 16) & 0xff) as u8,
+            ((hello.len() >> 8) & 0xff) as u8,
+            (hello.len() & 0xff) as u8,
+        ];
+        handshake.extend_from_slice(&hello);
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    pub(crate) fn ech_outer_payload(grease: bool) -> Vec<u8> {
+        // outer, KDF/AEAD IDs, config ID, encapsulated key, ciphertext. The
+        // passive parser must not try to decrypt or distinguish GREASE here.
+        let mut payload = vec![0, 0, 1, 0, 1, if grease { 0xff } else { 7 }, 0, 32];
+        payload.extend_from_slice(&[if grease { 0xa5 } else { 0x12 }; 32]);
+        payload.extend_from_slice(&64u16.to_be_bytes());
+        payload.extend_from_slice(&[if grease { 0x5a } else { 0x34 }; 64]);
+        payload
+    }
 }
 
 #[cfg(test)]
@@ -366,37 +464,33 @@ mod tests {
     impl AsyncStream for TestStream {}
 
     fn tls_client_hello(server_name: &str) -> Vec<u8> {
-        let name = server_name.as_bytes();
-        let mut sni = Vec::new();
-        sni.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
-        sni.push(0);
-        sni.extend_from_slice(&(name.len() as u16).to_be_bytes());
-        sni.extend_from_slice(name);
+        test_vectors::tls_client_hello(server_name, &[], true)
+    }
 
-        let mut hello = Vec::new();
-        hello.extend_from_slice(&[0x03, 0x03]);
-        hello.extend_from_slice(&[0u8; 32]);
-        hello.push(0); // session id
-        hello.extend_from_slice(&2u16.to_be_bytes());
-        hello.extend_from_slice(&[0x13, 0x01]);
-        hello.push(1);
-        hello.push(0);
-        hello.extend_from_slice(&((sni.len() + 4) as u16).to_be_bytes());
-        hello.extend_from_slice(&0u16.to_be_bytes());
-        hello.extend_from_slice(&(sni.len() as u16).to_be_bytes());
-        hello.extend_from_slice(&sni);
-
-        let mut handshake = vec![
-            1,
-            ((hello.len() >> 16) & 0xff) as u8,
-            ((hello.len() >> 8) & 0xff) as u8,
-            (hello.len() & 0xff) as u8,
-        ];
-        handshake.extend_from_slice(&hello);
-        let mut record = vec![0x16, 0x03, 0x01];
-        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
-        record.extend_from_slice(&handshake);
-        record
+    #[tokio::test(start_paused = true)]
+    async fn slow_partial_reads_share_one_deadline_and_preserve_replay() {
+        use tokio::io::AsyncWriteExt;
+        let (mut stream, mut writer) = tokio::io::duplex(256);
+        let task = tokio::spawn(async move {
+            writer.write_all(b"G").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            writer.write_all(b"E").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let _ = writer
+                .write_all(b"T / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                .await;
+        });
+        let start = tokio::time::Instant::now();
+        let mut replay = Vec::new();
+        assert!(
+            super::sniff_tcp(&mut stream, &mut replay)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(start.elapsed(), std::time::Duration::from_millis(300));
+        assert_eq!(replay, b"GE");
+        task.abort();
     }
 
     #[test]
@@ -407,6 +501,7 @@ mod tests {
             TcpPrefixClassification::Matched(SniffedTcpMetadata {
                 protocol: RouteProtocol::Http,
                 domain: Some("example.com".into()),
+                analysis_domain: Some("example.com".into()),
             })
         );
     }
@@ -435,6 +530,7 @@ mod tests {
             TcpPrefixClassification::Matched(SniffedTcpMetadata {
                 protocol: RouteProtocol::Tls,
                 domain: Some("tls.example.com".into()),
+                analysis_domain: Some("tls.example.com".into()),
             })
         );
         assert_eq!(
@@ -451,6 +547,93 @@ mod tests {
             classify_tcp_prefix(&hello),
             TcpPrefixClassification::NoMatch
         );
+    }
+
+    #[test]
+    fn ech_before_or_after_sni_hides_only_the_analysis_name() {
+        for grease in [false, true] {
+            let ech = test_vectors::ech_outer_payload(grease);
+            for sni_first in [false, true] {
+                let hello = test_vectors::tls_client_hello(
+                    "Public.Example.COM",
+                    &[(0x2a2a, &[]), (0xfe0d, &ech)],
+                    sni_first,
+                );
+                assert_eq!(
+                    classify_tcp_prefix(&hello),
+                    TcpPrefixClassification::Matched(SniffedTcpMetadata {
+                        protocol: RouteProtocol::Tls,
+                        domain: Some("public.example.com".into()),
+                        analysis_domain: None,
+                    }),
+                    "ECH/GREASE {grease}, SNI first {sni_first}",
+                );
+            }
+        }
+        for sni_first in [false, true] {
+            let hello = test_vectors::tls_client_hello(
+                "Public.Example.COM",
+                &[(0x2a2a, &[]), (43, &[2, 3, 4])],
+                sni_first,
+            );
+            let TcpPrefixClassification::Matched(metadata) = classify_tcp_prefix(&hello) else {
+                panic!("non-ECH ClientHello must remain classified");
+            };
+            assert_eq!(metadata.domain.as_deref(), Some("public.example.com"));
+            assert_eq!(metadata.analysis_domain, metadata.domain);
+        }
+    }
+
+    #[test]
+    fn malformed_extensions_do_not_restore_an_outer_analysis_name() {
+        let record = test_vectors::tls_client_hello("public.example.com", &[(0xfe0d, &[])], true);
+        let body = &record[9..];
+        for len in 0..body.len() {
+            // Truncation at every byte, including inside vector lengths, must
+            // terminate without an out-of-bounds read or a guessed domain.
+            assert!(
+                parse_client_hello_server_names(&body[..len])
+                    .analysis_domain
+                    .is_none()
+            );
+        }
+        let mut malformed = body.to_vec();
+        let length_offset = malformed.len() - 2;
+        malformed[length_offset..].copy_from_slice(&u16::MAX.to_be_bytes());
+        let names = parse_client_hello_server_names(&malformed);
+        assert_eq!(names.domain.as_deref(), Some("public.example.com"));
+        assert!(names.analysis_domain.is_none());
+
+        let mut partial_header = body.to_vec();
+        partial_header.pop();
+        let extension_len = partial_header.len() - 43;
+        partial_header[41..43].copy_from_slice(&(extension_len as u16).to_be_bytes());
+        let names = parse_client_hello_server_names(&partial_header);
+        assert_eq!(names.domain.as_deref(), Some("public.example.com"));
+        assert!(names.analysis_domain.is_none());
+
+        let normal_record = tls_client_hello("public.example.com");
+        let mut trailing = normal_record[9..].to_vec();
+        trailing.extend_from_slice(&[0xfe, 0x0d, 0, 0]);
+        let names = parse_client_hello_server_names(&trailing);
+        assert_eq!(names.domain.as_deref(), Some("public.example.com"));
+        assert!(names.analysis_domain.is_none());
+    }
+
+    #[tokio::test]
+    async fn fragmented_tcp_ech_keeps_routing_and_replays_the_complete_hello() {
+        let ech = test_vectors::ech_outer_payload(false);
+        let hello = test_vectors::tls_client_hello("public.example.com", &[(0xfe0d, &ech)], true);
+        let split = hello.len() - ech.len() - 4;
+        let mut stream = TestStream {
+            bytes: hello[split..].to_vec(),
+            offset: 0,
+        };
+        let mut replay = hello[..split].to_vec();
+        let metadata = sniff_tcp(&mut stream, &mut replay).await.unwrap().unwrap();
+        assert_eq!(metadata.domain.as_deref(), Some("public.example.com"));
+        assert_eq!(metadata.analysis_domain, None);
+        assert_eq!(replay, hello);
     }
 
     #[tokio::test]
