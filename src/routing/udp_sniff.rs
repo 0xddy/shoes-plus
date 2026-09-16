@@ -4,6 +4,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::protocol::ClientHelloServerNames;
+
 const MAX_BYTES: usize = 64 * 1024;
 const MAX_CRYPTO: usize = 16 * 1024;
 const MAX_FRAGMENTS: usize = 64;
@@ -51,7 +53,10 @@ impl UdpSniffer {
         self.done || Instant::now() >= self.deadline
     }
 
-    pub(crate) fn observe(&mut self, datagram: &[u8]) -> Option<(&'static str, Option<String>)> {
+    pub(crate) fn observe(
+        &mut self,
+        datagram: &[u8],
+    ) -> Option<(&'static str, Option<String>, bool)> {
         if self.expired() || self.packets >= 8 || datagram.len() > MAX_BYTES - self.bytes {
             self.crypto = None;
             self.done = true;
@@ -64,13 +69,15 @@ impl UdpSniffer {
             self.crypto = None;
             // A resolver association carries questions for many unrelated
             // domains. A question name is not this target's visited hostname.
-            return Some(("dns", None));
+            return Some(("dns", None, false));
         }
         match self.quic(datagram) {
-            Ok(Some(domain)) => {
+            Ok(Some(names)) => {
                 self.done = true;
                 self.crypto = None;
-                Some(("quic", domain))
+                names
+                    .analysis_valid
+                    .then_some(("quic", names.analysis_domain, names.ech_present))
             }
             Ok(None) => None,
             Err(()) => {
@@ -81,7 +88,7 @@ impl UdpSniffer {
         }
     }
 
-    fn quic(&mut self, bytes: &[u8]) -> Result<Option<Option<String>>, ()> {
+    fn quic(&mut self, bytes: &[u8]) -> Result<Option<ClientHelloServerNames>, ()> {
         let mut offset = 0;
         while offset < bytes.len() {
             if Instant::now() >= self.deadline {
@@ -198,7 +205,11 @@ impl Drop for Scratch {
 }
 
 impl Crypto {
-    fn frames(&mut self, payload: &[u8], deadline: Instant) -> Result<Option<Option<String>>, ()> {
+    fn frames(
+        &mut self,
+        payload: &[u8],
+        deadline: Instant,
+    ) -> Result<Option<ClientHelloServerNames>, ()> {
         let mut cursor = 0;
         while cursor < payload.len() {
             if Instant::now() >= deadline {
@@ -273,12 +284,9 @@ impl Crypto {
                             return Err(());
                         }
                         if self.contiguous >= len + 4 {
-                            return Ok(Some(
-                                super::protocol::parse_client_hello_server_names(
-                                    &self.data[4..len + 4],
-                                )
-                                .analysis_domain,
-                            ));
+                            return Ok(Some(super::protocol::parse_client_hello_server_names(
+                                &self.data[4..len + 4],
+                            )));
                         }
                     }
                 }
@@ -422,19 +430,19 @@ mod tests {
         assert!(flow.bytes.load(Ordering::Relaxed) >= CRYPTO_COST);
         assert_eq!(
             sniff.observe(&initial(b"samecid1", 2, 0, &hello[..32])),
-            Some(("quic", Some("www.youtube.com".into())))
+            Some(("quic", Some("www.youtube.com".into()), false))
         );
         assert_eq!(flow.bytes.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn quic_ech_and_grease_hide_the_outer_name_for_either_extension_order() {
+    fn quic_ech_and_grease_preserve_raw_outer_name_for_either_extension_order() {
         use super::super::protocol::test_vectors;
         for grease in [false, true] {
             let ech = test_vectors::ech_outer_payload(grease);
             for sni_first in [false, true] {
                 let record = test_vectors::tls_client_hello(
-                    "public.example.com",
+                    "Public.Example.COM.",
                     &[(0xfe0d, &ech)],
                     sni_first,
                 );
@@ -446,7 +454,10 @@ mod tests {
                 let final_packet = initial(b"echcid01", 1, split, &handshake[split..]);
                 let original = final_packet.clone();
                 assert!(sniff.observe(&first).is_none());
-                assert_eq!(sniff.observe(&final_packet), Some(("quic", None)));
+                assert_eq!(
+                    sniff.observe(&final_packet),
+                    Some(("quic", Some("Public.Example.COM.".into()), true)),
+                );
                 assert_eq!(final_packet, original);
                 assert_eq!(flow.bytes.load(Ordering::Relaxed), 0);
                 assert!(sniff.expired());
@@ -466,12 +477,24 @@ mod tests {
         handshake[length_offset..].copy_from_slice(&u16::MAX.to_be_bytes());
         let flow = Arc::new(Flow::default());
         let mut sniff = UdpSniffer::new(flow.clone());
-        assert_eq!(
-            sniff.observe(&initial(b"echcid01", 0, 0, &handshake)),
-            Some(("quic", None)),
-        );
+        assert_eq!(sniff.observe(&initial(b"echcid01", 0, 0, &handshake)), None,);
         assert_eq!(flow.bytes.load(Ordering::Relaxed), 0);
         assert!(sniff.expired());
+    }
+
+    #[test]
+    fn quic_invalid_utf8_sni_is_terminal_without_a_missing_domain_report() {
+        let mut handshake = hello("example.com");
+        *handshake.last_mut().unwrap() = 0xff;
+        let flow = Arc::new(Flow::default());
+        let mut sniff = UdpSniffer::new(flow.clone());
+        assert!(
+            sniff
+                .observe(&initial(b"badutf01", 0, 0, &handshake))
+                .is_none()
+        );
+        assert!(sniff.expired());
+        assert_eq!(flow.bytes.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -518,7 +541,7 @@ mod tests {
         packet.extend_from_slice(b"\x03www\x07youtube\x03com\x00\x00\x01\x00\x01");
         assert_eq!(dns_question(&packet).as_deref(), Some("www.youtube.com"));
         let mut sniff = UdpSniffer::new(Arc::new(Flow::default()));
-        assert_eq!(sniff.observe(&packet), Some(("dns", None)));
+        assert_eq!(sniff.observe(&packet), Some(("dns", None, false)));
         packet[12] = 0xc0;
         assert_eq!(dns_question(&packet), None);
     }

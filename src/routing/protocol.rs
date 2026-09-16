@@ -24,9 +24,15 @@ pub(crate) struct SniffedTcpMetadata {
     pub protocol: RouteProtocol,
     /// HTTP Host or TLS SNI.  Empty/missing values leave this as `None`.
     pub domain: Option<String>,
-    /// The visited name for analytics. ECH outer SNI remains usable for routing,
-    /// but cannot identify the encrypted destination (including GREASE ECH).
+    /// The visible HTTP host or TLS SNI, preserving its original spelling.
+    /// This is an observation, including an ECH outer name or GREASE ECH.
     pub analysis_domain: Option<String>,
+    /// An encrypted_client_hello extension was present; this does not confirm
+    /// ECH negotiation or identify the encrypted inner destination.
+    pub ech_present: bool,
+    /// False when the payload contains an unrepresentable or incomplete
+    /// observation. Such traffic must not become a missing-domain report.
+    pub analysis_valid: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,14 +165,15 @@ fn classify_http(bytes: &[u8]) -> TcpPrefixClassification {
     } else {
         None
     };
-    let domain = header_host
-        .map(str::to_owned)
-        .or(target_host)
-        .and_then(|host| normalize_authority_host(&host));
+    let authority = header_host.map(str::to_owned).or(target_host);
+    let domain = authority.as_deref().and_then(normalize_authority_host);
+    let analysis_domain = authority.as_deref().map(authority_host).map(str::to_owned);
     TcpPrefixClassification::Matched(SniffedTcpMetadata {
         protocol: RouteProtocol::Http,
-        analysis_domain: domain.clone(),
+        analysis_domain,
         domain,
+        ech_present: false,
+        analysis_valid: true,
     })
 }
 
@@ -213,6 +220,8 @@ fn classify_tls(bytes: &[u8]) -> TcpPrefixClassification {
                     protocol: RouteProtocol::Tls,
                     domain: names.domain,
                     analysis_domain: names.analysis_domain,
+                    ech_present: names.ech_present,
+                    analysis_valid: names.analysis_valid,
                 });
             }
         }
@@ -223,24 +232,32 @@ fn classify_tls(bytes: &[u8]) -> TcpPrefixClassification {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct ClientHelloServerNames {
     pub domain: Option<String>,
     pub analysis_domain: Option<String>,
+    pub ech_present: bool,
+    pub analysis_valid: bool,
 }
 
 pub(crate) fn parse_client_hello_server_names(hello: &[u8]) -> ClientHelloServerNames {
-    let mut names = ClientHelloServerNames::default();
-    // Scan the entire extension block: ECH commonly follows server_name. A
-    // malformed trailing extension must not expose an unverified outer name,
-    // while the first SNI is retained for the existing routing behavior.
-    if client_hello_has_ech(hello, &mut names.domain) == Some(false) {
-        names.analysis_domain = names.domain.clone();
+    let mut names = ClientHelloServerNames {
+        domain: None,
+        analysis_domain: None,
+        ech_present: false,
+        analysis_valid: true,
+    };
+    // Only report observations from a complete extension vector. Routing keeps
+    // its existing first-SNI behavior even if a later extension is malformed.
+    if let Some(ech_present) = client_hello_has_ech(hello, &mut names) {
+        names.ech_present = ech_present;
+    } else {
+        names.analysis_domain = None;
+        names.analysis_valid = false;
     }
     names
 }
 
-fn client_hello_has_ech(hello: &[u8], domain: &mut Option<String>) -> Option<bool> {
+fn client_hello_has_ech(hello: &[u8], names: &mut ClientHelloServerNames) -> Option<bool> {
     const ENCRYPTED_CLIENT_HELLO: usize = 0xfe0d;
     // legacy_version + random
     let mut offset = 34usize;
@@ -274,7 +291,20 @@ fn client_hello_has_ech(hello: &[u8], domain: &mut Option<String>) -> Option<boo
             // Retain the first SNI extension, as the routing parser did before
             // analytics needed the rest of the extension list.
             saw_server_name = true;
-            *domain = parse_server_name_extension(&hello[offset..extension_end]);
+            let mut raw = None;
+            if parse_server_name_extension(&hello[offset..extension_end], &mut raw).is_none() {
+                names.analysis_valid = false;
+            }
+            if let Some(raw) = raw {
+                if let Ok(name) = std::str::from_utf8(raw) {
+                    names.domain = normalize_authority_host(name);
+                    // The bounded sniffer owns the raw observation; the collector
+                    // rejects invalid lengths/NUL rather than recording an empty name.
+                    names.analysis_domain = Some(name.to_owned());
+                } else {
+                    names.analysis_valid = false;
+                }
+            }
         }
         offset = extension_end;
     }
@@ -283,7 +313,7 @@ fn client_hello_has_ech(hello: &[u8], domain: &mut Option<String>) -> Option<boo
     (extensions_end == hello.len()).then_some(has_ech)
 }
 
-fn parse_server_name_extension(extension: &[u8]) -> Option<String> {
+fn parse_server_name_extension<'a>(extension: &'a [u8], name: &mut Option<&'a [u8]>) -> Option<()> {
     let list_len = read_u16(extension, 0)?;
     let mut offset = 2usize;
     let list_end = offset.checked_add(list_len)?;
@@ -298,13 +328,12 @@ fn parse_server_name_extension(extension: &[u8]) -> Option<String> {
         if name_end > list_end {
             return None;
         }
-        if name_type == 0 {
-            let name = std::str::from_utf8(&extension[offset..name_end]).ok()?;
-            return normalize_authority_host(name);
+        if name_type == 0 && name.is_none() {
+            *name = Some(&extension[offset..name_end]);
         }
         offset = name_end;
     }
-    None
+    (offset == list_end && list_end == extension.len()).then_some(())
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Option<usize> {
@@ -323,12 +352,15 @@ fn skip_u16_vector(bytes: &[u8], offset: usize) -> Option<usize> {
     (end <= bytes.len()).then_some(end)
 }
 
-fn normalize_authority_host(authority: &str) -> Option<String> {
+/// Keep the same bounded UTF-8 observation contract as the analysis collector.
+/// Domain spelling and interpretation belong to the receiver, not the core.
+pub(crate) fn valid_analysis_domain(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 253 && !name.contains('\0')
+}
+
+fn authority_host(authority: &str) -> &str {
     let authority = authority.trim();
-    if authority.is_empty() {
-        return None;
-    }
-    let host = if let Some(rest) = authority.strip_prefix('[') {
+    if let Some(rest) = authority.strip_prefix('[') {
         rest.split_once(']').map_or(rest, |(host, _)| host)
     } else if let Some((host, port)) = authority.rsplit_once(':') {
         if port.parse::<u16>().is_ok() {
@@ -338,7 +370,11 @@ fn normalize_authority_host(authority: &str) -> Option<String> {
         }
     } else {
         authority
-    };
+    }
+}
+
+fn normalize_authority_host(authority: &str) -> Option<String> {
+    let host = authority_host(authority);
     let normalized = host.trim_end_matches('.').to_ascii_lowercase();
     (!normalized.is_empty()).then_some(normalized)
 }
@@ -501,9 +537,78 @@ mod tests {
             TcpPrefixClassification::Matched(SniffedTcpMetadata {
                 protocol: RouteProtocol::Http,
                 domain: Some("example.com".into()),
-                analysis_domain: Some("example.com".into()),
+                analysis_domain: Some("Example.COM".into()),
+                ech_present: false,
+                analysis_valid: true,
             })
         );
+    }
+
+    #[test]
+    fn http_observations_preserve_host_spelling_without_the_authority_port() {
+        for (authority, expected) in [
+            ("MiXeD.Example.:443", "MiXeD.Example."),
+            ("例子.测试:8080", "例子.测试"),
+            ("[2001:db8::1]:443", "2001:db8::1"),
+        ] {
+            let request = format!("GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+            let TcpPrefixClassification::Matched(metadata) =
+                classify_tcp_prefix(request.as_bytes())
+            else {
+                panic!("HTTP fixture must classify");
+            };
+            assert_eq!(metadata.analysis_domain.as_deref(), Some(expected));
+            assert!(metadata.analysis_valid);
+            assert!(!metadata.ech_present);
+        }
+    }
+
+    #[test]
+    fn raw_observation_boundaries_are_preserved_for_collector_validation() {
+        for name in ["a".repeat(253), "a".repeat(254), "nul\0name".to_owned()] {
+            let hello = tls_client_hello(&name);
+            let TcpPrefixClassification::Matched(metadata) = classify_tcp_prefix(&hello) else {
+                panic!("bounded TLS fixture must classify");
+            };
+            assert_eq!(metadata.analysis_domain.as_deref(), Some(name.as_str()));
+            assert!(metadata.analysis_valid);
+            let request = format!("GET / HTTP/1.1\r\nHost: {name}\r\n\r\n");
+            let TcpPrefixClassification::Matched(metadata) =
+                classify_tcp_prefix(request.as_bytes())
+            else {
+                panic!("bounded HTTP fixture must classify");
+            };
+            assert_eq!(metadata.analysis_domain.as_deref(), Some(name.as_str()));
+        }
+        assert!(valid_analysis_domain(&"é".repeat(126)));
+        assert!(!valid_analysis_domain(&"é".repeat(127)));
+        assert!(!valid_analysis_domain("nul\0name"));
+    }
+
+    #[test]
+    fn invalid_utf8_sni_is_not_a_missing_domain_observation() {
+        let mut hello = tls_client_hello("example.com");
+        *hello.last_mut().unwrap() = 0xff;
+        let TcpPrefixClassification::Matched(metadata) = classify_tcp_prefix(&hello) else {
+            panic!("routing classification must remain TLS");
+        };
+        assert_eq!(metadata.protocol, RouteProtocol::Tls);
+        assert_eq!(metadata.domain, None);
+        assert_eq!(metadata.analysis_domain, None);
+        assert!(!metadata.analysis_valid);
+    }
+
+    #[test]
+    fn malformed_server_name_vector_is_not_a_missing_domain_observation() {
+        let mut hello = tls_client_hello("example.com");
+        // TLS record + handshake + fixed ClientHello fields + extension header.
+        hello[56..58].copy_from_slice(&u16::MAX.to_be_bytes());
+        let TcpPrefixClassification::Matched(metadata) = classify_tcp_prefix(&hello) else {
+            panic!("routing classification must remain TLS");
+        };
+        assert_eq!(metadata.domain, None);
+        assert_eq!(metadata.analysis_domain, None);
+        assert!(!metadata.analysis_valid);
     }
 
     #[test]
@@ -530,7 +635,9 @@ mod tests {
             TcpPrefixClassification::Matched(SniffedTcpMetadata {
                 protocol: RouteProtocol::Tls,
                 domain: Some("tls.example.com".into()),
-                analysis_domain: Some("tls.example.com".into()),
+                analysis_domain: Some("TLS.Example.COM".into()),
+                ech_present: false,
+                analysis_valid: true,
             })
         );
         assert_eq!(
@@ -550,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn ech_before_or_after_sni_hides_only_the_analysis_name() {
+    fn ech_before_or_after_sni_preserves_raw_name_and_presence() {
         for grease in [false, true] {
             let ech = test_vectors::ech_outer_payload(grease);
             for sni_first in [false, true] {
@@ -564,7 +671,9 @@ mod tests {
                     TcpPrefixClassification::Matched(SniffedTcpMetadata {
                         protocol: RouteProtocol::Tls,
                         domain: Some("public.example.com".into()),
-                        analysis_domain: None,
+                        analysis_domain: Some("Public.Example.COM".into()),
+                        ech_present: true,
+                        analysis_valid: true,
                     }),
                     "ECH/GREASE {grease}, SNI first {sni_first}",
                 );
@@ -580,12 +689,16 @@ mod tests {
                 panic!("non-ECH ClientHello must remain classified");
             };
             assert_eq!(metadata.domain.as_deref(), Some("public.example.com"));
-            assert_eq!(metadata.analysis_domain, metadata.domain);
+            assert_eq!(
+                metadata.analysis_domain.as_deref(),
+                Some("Public.Example.COM")
+            );
+            assert!(!metadata.ech_present);
         }
     }
 
     #[test]
-    fn malformed_extensions_do_not_restore_an_outer_analysis_name() {
+    fn malformed_extensions_do_not_report_unverified_observations() {
         let record = test_vectors::tls_client_hello("public.example.com", &[(0xfe0d, &[])], true);
         let body = &record[9..];
         for len in 0..body.len() {
@@ -603,6 +716,7 @@ mod tests {
         let names = parse_client_hello_server_names(&malformed);
         assert_eq!(names.domain.as_deref(), Some("public.example.com"));
         assert!(names.analysis_domain.is_none());
+        assert!(!names.analysis_valid);
 
         let mut partial_header = body.to_vec();
         partial_header.pop();
@@ -632,7 +746,11 @@ mod tests {
         let mut replay = hello[..split].to_vec();
         let metadata = sniff_tcp(&mut stream, &mut replay).await.unwrap().unwrap();
         assert_eq!(metadata.domain.as_deref(), Some("public.example.com"));
-        assert_eq!(metadata.analysis_domain, None);
+        assert_eq!(
+            metadata.analysis_domain.as_deref(),
+            Some("public.example.com")
+        );
+        assert!(metadata.ech_present);
         assert_eq!(replay, hello);
     }
 

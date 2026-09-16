@@ -40,6 +40,9 @@ pub struct AnalysisMetadata {
     /// Only an actually sniffed hostname; the destination hostname is separate.
     pub domain: Option<String>,
     pub app_protocol: Option<&'static str>,
+    /// TLS/QUIC encrypted_client_hello extension presence, including GREASE.
+    pub ech_present: bool,
+    /// Original requested destination, captured before routing/sniff overrides.
     pub destination: Option<AnalysisTarget>,
     pub sniff_destination: Option<AnalysisTarget>,
 }
@@ -61,7 +64,14 @@ pub trait AnalysisFlow: Send + Sync {
     fn finish(&self, token: u64, upload: u64, download: u64, target: Option<&AnalysisTarget>);
     /// The wrapper has a terminal Web result for this exact target. Even if
     /// detail storage is full, the observer can retain user/unknown totals.
-    fn finish_web(&self, token: u64, upload: u64, download: u64, target: Option<&AnalysisTarget>) {
+    fn finish_web(
+        &self,
+        token: u64,
+        upload: u64,
+        download: u64,
+        target: Option<&AnalysisTarget>,
+        _identified: bool,
+    ) {
         self.finish(token, upload, download, target);
     }
     fn cancel(&self, token: u64);
@@ -74,6 +84,7 @@ pub trait AnalysisFlow: Send + Sync {
         _target: &AnalysisTarget,
         _domain: Option<&str>,
         _app_protocol: &str,
+        _ech_present: bool,
     ) -> bool {
         true
     }
@@ -130,6 +141,9 @@ impl AnalysisUserContext {
         sniffed: Option<&SniffedTcpMetadata>,
         expected_generation: Option<u64>,
     ) -> Option<Arc<FlowHandle>> {
+        if sniffed.is_some_and(|metadata| !metadata.analysis_valid) {
+            return None;
+        }
         let observer = self.slot.0.load();
         let observer = observer.as_ref()?;
         if !observer.0.enabled() {
@@ -146,6 +160,7 @@ impl AnalysisUserContext {
             user_id: user_id.to_owned(),
             network,
             domain: sniffed.and_then(|metadata| metadata.analysis_domain.clone()),
+            ech_present: sniffed.is_some_and(|metadata| metadata.ech_present),
             app_protocol: sniffed.map(|metadata| match metadata.protocol {
                 crate::routing::predicate::RouteProtocol::Http => "http",
                 crate::routing::predicate::RouteProtocol::Tls => "tls",
@@ -325,6 +340,7 @@ struct AnalysisStream<T> {
     sniff_slot: Option<SniffSlot>,
     excluded: bool,
     web: bool,
+    identified: bool,
     _storage: StorageReservation,
 }
 
@@ -394,6 +410,7 @@ impl<T> AnalysisStream<T> {
             sniff_slot: None,
             excluded: false,
             web: false,
+            identified: false,
             _storage: storage,
         })
     }
@@ -412,7 +429,7 @@ impl<T> AnalysisStream<T> {
             if self.web {
                 self.flow
                     .0
-                    .finish_web(token, 0, count, self.target.as_ref());
+                    .finish_web(token, 0, count, self.target.as_ref(), self.identified);
             } else {
                 self.flow.0.finish(token, 0, count, self.target.as_ref());
             }
@@ -423,7 +440,7 @@ impl<T> AnalysisStream<T> {
             if self.web {
                 self.flow
                     .0
-                    .finish_web(token, count, 0, self.target.as_ref());
+                    .finish_web(token, count, 0, self.target.as_ref(), self.identified);
             } else {
                 self.flow.0.finish(token, count, 0, self.target.as_ref());
             }
@@ -473,8 +490,8 @@ impl<T> AnalysisStream<T> {
             return;
         }
         if let Some((sniff, _)) = &mut self.sniff {
-            if let Some((protocol, domain)) = sniff.observe(bytes) {
-                self.apply_classification(token, protocol, domain.as_deref());
+            if let Some((protocol, domain, ech_present)) = sniff.observe(bytes) {
+                self.apply_classification(token, protocol, domain.as_deref(), ech_present);
                 return;
             }
             if sniff.expired() {
@@ -483,13 +500,32 @@ impl<T> AnalysisStream<T> {
         }
     }
 
-    fn apply_classification(&mut self, token: u64, protocol: &str, domain: Option<&str>) {
-        let accepted = self
-            .target
-            .as_ref()
-            .is_some_and(|target| self.flow.0.classify_target(token, target, domain, protocol));
+    fn apply_classification(
+        &mut self,
+        token: u64,
+        protocol: &str,
+        domain: Option<&str>,
+        ech_present: bool,
+    ) {
+        let accepted = self.target.as_ref().is_some_and(|target| {
+            self.flow
+                .0
+                .classify_target(token, target, domain, protocol, ech_present)
+        });
         if accepted && matches!(protocol, "http" | "tls" | "quic") {
             self.web = true;
+            self.identified = domain.is_some_and(crate::routing::protocol::valid_analysis_domain)
+                || self.target.as_ref().is_some_and(|target| {
+                    target.port != 0
+                        && crate::routing::protocol::valid_analysis_domain(&target.host)
+                        && target
+                            .host
+                            .strip_prefix('[')
+                            .and_then(|host| host.strip_suffix(']'))
+                            .unwrap_or(&target.host)
+                            .parse::<std::net::IpAddr>()
+                            .is_err()
+                });
             self.sniff = None;
             self.sniff_slot = None;
             if self._storage.pending {
@@ -639,6 +675,8 @@ mod tests {
         begins: AtomicUsize,
         discarded: AtomicUsize,
         epoch: AtomicUsize,
+        classified_ech: AtomicUsize,
+        identified_finishes: AtomicUsize,
     }
 
     impl AnalysisFlow for BudgetFlow {
@@ -647,6 +685,11 @@ mod tests {
             self.epoch.load(Ordering::Relaxed).max(1) as u64
         }
         fn finish(&self, _: u64, _: u64, _: u64, _: Option<&AnalysisTarget>) {}
+        fn finish_web(&self, _: u64, _: u64, _: u64, _: Option<&AnalysisTarget>, identified: bool) {
+            if identified {
+                self.identified_finishes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         fn cancel(&self, _: u64) {
             self.cancelled.fetch_add(1, Ordering::Relaxed);
         }
@@ -662,7 +705,11 @@ mod tests {
             _: &AnalysisTarget,
             _: Option<&str>,
             _: &str,
+            ech_present: bool,
         ) -> bool {
+            if ech_present {
+                self.classified_ech.fetch_add(1, Ordering::Relaxed);
+            }
             token == self.epoch.load(Ordering::Relaxed).max(1) as u64
         }
         fn try_reserve_storage(&self, bytes: usize) -> bool {
@@ -869,7 +916,7 @@ mod tests {
         // is still stale and must not install the wrapper's persistent Web flag.
         budget.epoch.store(2, Ordering::Relaxed);
         stream.sniff_epoch = 1;
-        stream.apply_classification(1, "quic", Some("youtube.com"));
+        stream.apply_classification(1, "quic", Some("youtube.com"), false);
         assert!(stream.excluded);
         assert!(!stream.web);
         assert!(stream._storage.pending);
@@ -881,5 +928,85 @@ mod tests {
         assert!(budget.reserved.load(Ordering::Relaxed) > 0);
         drop(stream);
         assert_eq!(budget.reserved.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn confirmed_udp_targets_retain_identification_without_domain_storage() {
+        for (host, domain, expected) in [
+            ("192.0.2.1", Some("Public.Example."), true),
+            ("Requested.Example.", None, true),
+            ("192.0.2.1", None, false),
+            ("2001:db8::1", None, false),
+            ("192.0.2.1", Some("invalid\0domain"), false),
+        ] {
+            let budget = Arc::new(BudgetFlow::default());
+            budget.allowed.store(true, Ordering::Relaxed);
+            let (inner, _peer) = tokio::io::duplex(64);
+            let destination = NetLocation::new(crate::address::Address::from(host).unwrap(), 443);
+            let mut stream = match AnalysisStream::try_new(
+                inner,
+                Arc::new(FlowHandle(budget.clone())),
+                Some(&destination),
+            ) {
+                Ok(stream) => stream,
+                Err(_) => panic!("available budget"),
+            };
+            stream.write_begin();
+            stream.apply_classification(1, "quic", domain, true);
+            assert!(stream.web);
+            assert_eq!(stream.identified, expected);
+            assert_eq!(budget.classified_ech.load(Ordering::Relaxed), 1);
+            stream.write_done(5);
+            stream.read_begin();
+            stream.read_done(7);
+            assert_eq!(
+                budget.identified_finishes.load(Ordering::Relaxed),
+                if expected { 2 } else { 0 },
+            );
+        }
+    }
+
+    #[test]
+    fn registration_preserves_raw_observations_and_rejects_unrepresentable_names() {
+        #[derive(Default)]
+        struct Observer(std::sync::Mutex<Vec<AnalysisMetadata>>);
+        impl AnalysisObserver for Observer {
+            fn register(&self, metadata: AnalysisMetadata) -> Option<Arc<dyn AnalysisFlow>> {
+                self.0.lock().unwrap().push(metadata);
+                Some(Arc::new(BudgetFlow::default()))
+            }
+        }
+        let observer = Arc::new(Observer::default());
+        let slot = Arc::new(AnalysisSlot::default());
+        slot.set(Some(observer.clone()));
+        let context = AnalysisUserContext {
+            slot,
+            inbound_tag: "test".into(),
+        };
+        let destination = NetLocation::from_str("Requested.Example.:443", None).unwrap();
+        let mut sniffed = SniffedTcpMetadata {
+            protocol: crate::routing::predicate::RouteProtocol::Tls,
+            domain: Some("public.example".into()),
+            analysis_domain: Some("Public.Example.".into()),
+            ech_present: true,
+            analysis_valid: true,
+        };
+        let flow = context.register("user", "tcp", Some(&destination), Some(&sniffed), None);
+        assert!(flow.is_some());
+        let recorded = observer.0.lock().unwrap()[0].clone();
+        assert_eq!(recorded.domain.as_deref(), Some("Public.Example."));
+        assert!(recorded.ech_present);
+        assert_eq!(
+            recorded.destination.as_ref().unwrap().host,
+            "Requested.Example."
+        );
+        assert_eq!(recorded.sniff_destination, recorded.destination);
+        sniffed.analysis_valid = false;
+        assert!(
+            context
+                .register("user", "tcp", Some(&destination), Some(&sniffed), None)
+                .is_none()
+        );
+        assert_eq!(observer.0.lock().unwrap().len(), 1);
     }
 }

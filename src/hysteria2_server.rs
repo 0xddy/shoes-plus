@@ -6,6 +6,7 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::str;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -14,7 +15,7 @@ use log::{debug, warn};
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngExt};
 use rustc_hash::FxHashMap;
-use tokio::io::{AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout, timeout_at};
@@ -125,7 +126,7 @@ const MAX_UDP_QUEUED_BYTES_PER_CONNECTION: usize = 16 * 1024 * 1024;
 const CLOSE_ERR_CODE_OK: u32 = 0x100; // HTTP3 ErrCodeNoError
 
 use crate::address::NetLocation;
-use crate::async_stream::{AsyncMessageStream, AsyncStream};
+use crate::async_stream::{AsyncMessageStream, AsyncPing, AsyncStream};
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::dynamic::{
@@ -1917,6 +1918,90 @@ enum TcpResponseWrite {
     PeerStopped,
 }
 
+/// After successful outbound setup, cancellation of the HY2 response direction
+/// must not cancel the independent upload. Keep draining the target into a sink
+/// after STOP_SENDING so dropping a socket with unread data cannot reset it.
+///
+/// This wrapper sits outside TrafficMeterStream: discarded responses are never
+/// handed to QUIC or charged as transmitted bytes. Upload reads still use the
+/// original metered stream, and the ordinary bounded relay provides scheduling.
+struct Hysteria2ResponseStream<S> {
+    inner: S,
+    peer_stopped: bool,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Hysteria2ResponseStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Hysteria2ResponseStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.peer_stopped {
+            return Poll::Ready(Ok(buf.len()));
+        }
+        match Pin::new(&mut this.inner).poll_write(cx, buf) {
+            Poll::Ready(Err(error))
+                if matches!(
+                    error
+                        .get_ref()
+                        .and_then(|cause| cause.downcast_ref::<quinn::WriteError>()),
+                    Some(quinn::WriteError::Stopped(_))
+                ) =>
+            {
+                this.peer_stopped = true;
+                Poll::Ready(Ok(buf.len()))
+            }
+            result => result,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.peer_stopped {
+            Poll::Ready(Ok(()))
+        } else {
+            Pin::new(&mut this.inner).poll_flush(cx)
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.peer_stopped {
+            Poll::Ready(Ok(()))
+        } else {
+            Pin::new(&mut this.inner).poll_shutdown(cx)
+        }
+    }
+}
+
+impl<S: AsyncPing + Unpin> AsyncPing for Hysteria2ResponseStream<S> {
+    fn supports_ping(&self) -> bool {
+        !self.peer_stopped && self.inner.supports_ping()
+    }
+
+    fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
+        let this = self.get_mut();
+        if this.peer_stopped {
+            Poll::Ready(Ok(false))
+        } else {
+            Pin::new(&mut this.inner).poll_write_ping(cx)
+        }
+    }
+}
+
+impl<S: AsyncStream> AsyncStream for Hysteria2ResponseStream<S> {}
+
 async fn write_tcp_response<W>(
     stream: &mut W,
     ok: bool,
@@ -1986,9 +2071,10 @@ async fn process_tcp_stream(
     // they are bytes the client put on the wire and had put back to it. Reading the
     // header through the wrapper is also what makes `handle_tcp_header` take one
     // stream instead of quinn's send and recv halves.
+    let quic_stream = QuicStream::from(send, recv).with_reset_on_send_stopped();
     let mut server_stream: Box<dyn AsyncStream> = match meter {
-        Some(meter) => Box::new(TrafficMeterStream::new(QuicStream::from(send, recv), meter)),
-        None => Box::new(QuicStream::from(send, recv)),
+        Some(meter) => Box::new(TrafficMeterStream::new(quic_stream, meter)),
+        None => Box::new(quic_stream),
     };
 
     let header = read_tcp_request_header_before_deadline(
@@ -2056,13 +2142,13 @@ async fn process_tcp_stream(
     // Match sing-box: a successful TCP response reports that routing, DNS and the
     // outbound dial have all completed, not merely that the request parsed.
     let response = write_tcp_response(&mut server_stream, true, "").await?;
-    let mut client_stream = if response == TcpResponseWrite::PeerStopped {
-        // The client no longer wants reverse traffic, including any bytes the
-        // outbound handshake already buffered. Retain the target for the upload.
-        client_setup.client_stream
-    } else {
-        apply_client_early_data(&mut server_stream, client_setup).await?
-    };
+    // STOP_SENDING may arrive during the status, buffered outbound early data,
+    // or any later response write. Preserve the upload across all three phases.
+    let mut server_stream: Box<dyn AsyncStream> = Box::new(Hysteria2ResponseStream {
+        inner: server_stream,
+        peer_stopped: response == TcpResponseWrite::PeerStopped,
+    });
+    let mut client_stream = apply_client_early_data(&mut server_stream, client_setup).await?;
 
     let client_requires_flush = if replay.is_empty() {
         false
@@ -2071,35 +2157,18 @@ async fn process_tcp_stream(
         true
     };
 
-    let copy_result = if response == TcpResponseWrite::PeerStopped {
-        // Discard reverse traffic after cancellation, but keep reading it: a
-        // target may write before reading the upload, and dropping a TCP socket
-        // with unread data can reset it while upload bytes are still in flight.
-        let (mut target_read, mut target_write) = tokio::io::split(&mut client_stream);
-        let upload = async {
-            if client_requires_flush {
-                target_write.flush().await?;
-            }
-            tokio::io::copy(&mut server_stream, &mut target_write).await?;
-            // The target needs FIN to finish the file and close its reply side.
-            target_write.shutdown().await
-        };
-        let mut discarded = tokio::io::sink();
-        let drain = tokio::io::copy(&mut target_read, &mut discarded);
-        tokio::try_join!(upload, drain).map(|_| ())
-    } else {
-        // Use 32KB buffers to match hysteria2/sing-box reference implementations
-        copy_bidirectional_with_sizes(
-            &mut server_stream,
-            &mut client_stream,
-            // no need to flush even though we wrote this response since it's QUIC
-            false,
-            client_requires_flush,
-            32768,
-            32768,
-        )
-        .await
-    };
+    // Both normal responses and discarded responses use the same bounded,
+    // cooperative relay. Each direction still waits for its own EOF and FIN.
+    let copy_result = copy_bidirectional_with_sizes(
+        &mut server_stream,
+        &mut client_stream,
+        // no need to flush even though we wrote this response since it's QUIC
+        false,
+        client_requires_flush,
+        32768,
+        32768,
+    )
+    .await;
 
     let (_, _) = futures::join!(server_stream.shutdown(), client_stream.shutdown());
 
@@ -2351,13 +2420,14 @@ pub async fn start_hysteria2_server(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_ACTIVE_TCP_LOGICAL_FLOWS, MAX_FRAGMENT_CACHE_SIZE, MAX_TCP_RESPONSE_MESSAGE_LENGTH,
-        MAX_UDP_FRAGMENT_BYTES_PER_CONNECTION, MAX_UDP_PACKET_SIZE, MAX_UDP_TARGETS_PER_SESSION,
-        TCP_REQUEST_HEADER_TIMEOUT, TcpResponseWrite, UdpForwardCommand, UdpFragmentCache,
-        UdpResponseSendOutcome, UdpSession, UdpTargetEvent, UdpTargetPermit, UdpTargetWorker,
-        acquire_udp_target_permits, checked_response_fragment_count, checked_udp_packet_len,
-        cleanup_udp_sessions, connect_udp_target, decode_udp_address_length,
-        dispatch_udp_target_command, encode_tcp_response, read_tcp_request_header_before_deadline,
+        Hysteria2ResponseStream, MAX_ACTIVE_TCP_LOGICAL_FLOWS, MAX_FRAGMENT_CACHE_SIZE,
+        MAX_TCP_RESPONSE_MESSAGE_LENGTH, MAX_UDP_FRAGMENT_BYTES_PER_CONNECTION,
+        MAX_UDP_PACKET_SIZE, MAX_UDP_TARGETS_PER_SESSION, TCP_REQUEST_HEADER_TIMEOUT,
+        TcpResponseWrite, UdpForwardCommand, UdpFragmentCache, UdpResponseSendOutcome, UdpSession,
+        UdpTargetEvent, UdpTargetPermit, UdpTargetWorker, acquire_udp_target_permits,
+        checked_response_fragment_count, checked_udp_packet_len, cleanup_udp_sessions,
+        connect_udp_target, decode_udp_address_length, dispatch_udp_target_command,
+        encode_tcp_response, read_tcp_request_header_before_deadline,
         run_connected_udp_target_worker, send_udp_response_with, try_admit_tcp_logical_flow,
         try_reserve_payload_bytes, try_reserve_udp_target_worker, udp_response_send_allowed,
         valid_udp_fragment, write_tcp_fast_open_replay, write_tcp_response,
@@ -2388,7 +2458,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
     use tokio::sync::Semaphore;
     use tokio::time::{Instant, advance};
     use tokio_util::sync::CancellationToken;
@@ -3346,6 +3416,146 @@ mod tests {
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    struct ResponseStreamProbe {
+        upload: std::io::Cursor<Vec<u8>>,
+        accepted: Vec<u8>,
+        accepted_limit: usize,
+        write_error: quinn::WriteError,
+        read_error: Option<quinn::ReadError>,
+        write_polls: usize,
+    }
+
+    impl ResponseStreamProbe {
+        fn new(write_error: quinn::WriteError) -> Self {
+            Self {
+                upload: std::io::Cursor::new(b"complete upload".to_vec()),
+                accepted: Vec::new(),
+                accepted_limit: 0,
+                write_error,
+                read_error: None,
+                write_polls: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for ResponseStreamProbe {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if let Some(error) = &this.read_error {
+                return Poll::Ready(Err(error.clone().into()));
+            }
+            Pin::new(&mut this.upload).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for ResponseStreamProbe {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            this.write_polls += 1;
+            let remaining = this.accepted_limit - this.accepted.len();
+            if remaining == 0 {
+                return Poll::Ready(Err(this.write_error.clone().into()));
+            }
+            let written = remaining.min(buf.len());
+            this.accepted.extend_from_slice(&buf[..written]);
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_response_stream_preserves_upload_after_partial_reverse_write() {
+        for code in [0u32, 42] {
+            let mut inner = ResponseStreamProbe::new(quinn::WriteError::Stopped(code.into()));
+            inner.accepted_limit = 3;
+            let mut stream = Hysteria2ResponseStream {
+                inner,
+                peer_stopped: false,
+            };
+            stream.write_all(b"early data").await.unwrap();
+            stream.write_all(b"later response").await.unwrap();
+            stream.flush().await.unwrap();
+            stream.shutdown().await.unwrap();
+            assert_eq!(stream.inner.accepted, b"ear");
+            assert_eq!(stream.inner.write_polls, 2);
+            let mut upload = Vec::new();
+            stream.read_to_end(&mut upload).await.unwrap();
+            assert_eq!(upload, b"complete upload");
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_response_stream_skips_metered_writes_after_initial_stop() {
+        let mut stream = Hysteria2ResponseStream {
+            inner: ResponseStreamProbe::new(quinn::WriteError::Stopped(0u32.into())),
+            peer_stopped: true,
+        };
+        stream
+            .write_all(b"buffered outbound response")
+            .await
+            .unwrap();
+        assert_eq!(stream.inner.write_polls, 0);
+        assert!(stream.inner.accepted.is_empty());
+        let mut upload = Vec::new();
+        stream.read_to_end(&mut upload).await.unwrap();
+        assert_eq!(upload, b"complete upload");
+    }
+
+    #[tokio::test]
+    async fn tcp_response_stream_preserves_other_transport_errors() {
+        for error in [
+            quinn::WriteError::ConnectionLost(quinn::ConnectionError::TimedOut),
+            quinn::WriteError::ClosedStream,
+            quinn::WriteError::ZeroRttRejected,
+        ] {
+            let mut stream = Hysteria2ResponseStream {
+                inner: ResponseStreamProbe::new(error.clone()),
+                peer_stopped: false,
+            };
+            let failure = stream.write_all(b"response").await.unwrap_err();
+            assert_eq!(
+                failure
+                    .get_ref()
+                    .and_then(|cause| cause.downcast_ref::<quinn::WriteError>()),
+                Some(&error)
+            );
+            assert!(!stream.peer_stopped);
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_response_stream_does_not_mask_upload_reset() {
+        let mut inner = ResponseStreamProbe::new(quinn::WriteError::Stopped(0u32.into()));
+        inner.read_error = Some(quinn::ReadError::Reset(7u32.into()));
+        let mut stream = Hysteria2ResponseStream {
+            inner,
+            peer_stopped: false,
+        };
+        stream.write_all(b"discarded response").await.unwrap();
+        let error = stream.read(&mut [0; 16]).await.unwrap_err();
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<quinn::ReadError>()),
+            Some(quinn::ReadError::Reset(code)) if *code == 7u32.into()
+        ));
     }
 
     #[tokio::test]

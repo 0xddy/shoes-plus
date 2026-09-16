@@ -9,6 +9,7 @@ use crate::async_stream::{AsyncPing, AsyncStream};
 pub struct QuicStream {
     send_stream: SendStream,
     recv_stream: RecvStream,
+    reset_on_send_stopped: bool,
 }
 
 impl QuicStream {
@@ -16,7 +17,15 @@ impl QuicStream {
         Self {
             send_stream,
             recv_stream,
+            reset_on_send_stopped: false,
         }
+    }
+
+    /// Used by HY2 when the caller preserves the upload after a response STOP.
+    /// Reset the cancelled send half before keeping this stream alive to drain.
+    pub(crate) fn with_reset_on_send_stopped(mut self) -> Self {
+        self.reset_on_send_stopped = true;
+        self
     }
 }
 
@@ -38,9 +47,15 @@ impl AsyncWrite for QuicStream {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        Pin::new(&mut this.send_stream)
-            .poll_write(cx, buf)
-            .map_err(|err| err.into())
+        let result = Pin::new(&mut this.send_stream).poll_write(cx, buf);
+        if this.reset_on_send_stopped
+            && let Poll::Ready(Err(quinn::WriteError::Stopped(code))) = &result
+        {
+            // Match SendStream's drop cleanup without dropping the independent
+            // receive half. Preserve Stopped for the HY2 response sink.
+            let _ = this.send_stream.reset(*code);
+        }
+        result.map_err(|err| err.into())
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
